@@ -1,4 +1,13 @@
 // src/offline/ordenesTecnicoLocalPatch.js
+//
+// ============================================================================
+// CONVENCIÓN DE MARCAS (FMS)
+//   // FMS NUEVO - INICIO ... // FMS NUEVO - FIN
+//       Código agregado en esta revisión.
+//   // FMS ELIMINADO - INICIO ... // FMS ELIMINADO - FIN
+//       Código anterior que se retira (queda comentado para comparar).
+// Todo lo que no tiene marca queda exactamente igual que antes.
+// ============================================================================
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import {
@@ -62,6 +71,81 @@ function getEffectiveStatusCode(item) {
   const codes = extractStatusCodes(rawStatus);
   return codes[codes.length - 1] || "";
 }
+
+// FMS NUEVO - INICIO
+// SAP procesa los paquetes bulk en segundo plano ("Paquete masivo recibido con
+// éxito. Procesando en segundo plano"). Durante ese lapso, SAP sigue devolviendo
+// el estatus anterior. Para que la app no "retroceda" el estatus, el parche local
+// se conserva un tiempo después de enviado, mientras SAP no lo alcance.
+export const SENT_GRACE_MS = 15 * 60 * 1000; // 15 min de margen tras el envío
+
+// Orden lógico del flujo. Un código desconocido NO participa (gana SAP).
+const STATUS_RANK = {
+  "": 0,
+  "0100": 1,
+  "0200": 2,
+  "0400": 3,
+  "0300": 4,
+  "0500": 4,
+  "0600": 4,
+};
+
+const statusRank = (code) => {
+  const key = normalizeStatusCode(code);
+  return Object.prototype.hasOwnProperty.call(STATUS_RANK, key)
+    ? STATUS_RANK[key]
+    : null;
+};
+
+// ¿Debe el parche local seguir mandando sobre lo que dice SAP?
+//  - Si la orden sigue en la cola SAP: sí (comportamiento original).
+//  - Si ya se envió hace menos de SENT_GRACE_MS y SAP todavía va ATRÁS del
+//    parche: sí (SAP aún no procesa el paquete).
+//  - En cualquier otro caso: no (gana SAP, como antes).
+function shouldKeepPatch(patch, sapCode, pendingInQueue) {
+  if (!patch) return false;
+
+  const patchCode = normalizeStatusCode(patch.estatus_code);
+  if (!patchCode) return false;
+
+  if (pendingInQueue) return true;
+
+  const sentAt = Number(patch.sentAt || 0);
+  const withinGrace =
+    patch.pendingSync === false &&
+    sentAt > 0 &&
+    Date.now() - sentAt < SENT_GRACE_MS;
+
+  if (!withinGrace) return false;
+
+  const sapRank = statusRank(sapCode);
+  const patchRank = statusRank(patchCode);
+
+  if (sapRank === null || patchRank === null) return false;
+
+  return sapRank < patchRank;
+}
+// FMS NUEVO - FIN
+
+// FMS NUEVO - INICIO
+// Helpers para confirmar contra SAP el estatus de UNA orden (ver statusConfirmation.js).
+
+// Estatus efectivo de una orden tal como la devuelve SAP/backend.
+export function extractEffectiveStatusCode(item) {
+  return getEffectiveStatusCode(item);
+}
+
+// ¿SAP ya alcanzó (o superó) el estatus esperado? Un código desconocido se
+// considera alcanzado: en caso de duda manda SAP, como antes.
+export function hasSapReachedStatus(sapCode, expectedCode) {
+  const sapRank = statusRank(sapCode);
+  const expectedRank = statusRank(expectedCode);
+
+  if (sapRank === null || expectedRank === null) return true;
+
+  return sapRank >= expectedRank;
+}
+// FMS NUEVO - FIN
 
 export function getPreviousStatusForTransition(nextStatus, currentStatus = "") {
   const next = normalizeStatusCode(nextStatus);
@@ -212,7 +296,21 @@ export async function reconcileStatusPatchesWithSap(userEmail, sapOrders = []) {
     const sapCode = getEffectiveStatusCode(item);
     const patchCode = normalizeStatusCode(patchMap?.[orderId]?.estatus_code);
 
-    if (patchCode && pendingOrderIds.has(orderId)) {
+    // FMS ELIMINADO - INICIO
+    // Antes: el parche solo sobrevivía mientras la orden siguiera en la cola SAP.
+    // En cuanto salía de la cola se borraba y mandaba lo que dijera SAP, aunque
+    // SAP todavía no hubiera procesado el paquete (procesa en segundo plano).
+    // if (patchCode && pendingOrderIds.has(orderId)) {
+    // FMS ELIMINADO - FIN
+
+    // FMS NUEVO - INICIO
+    // Ahora: además de la cola, el parche sobrevive un margen tras el envío
+    // mientras SAP siga reportando un estatus anterior.
+    if (
+      patchCode &&
+      shouldKeepPatch(patchMap?.[orderId], sapCode, pendingOrderIds.has(orderId))
+    ) {
+    // FMS NUEVO - FIN
       detailsToUpdate.push({ orderId, code: patchCode });
       return buildStatusFields(item, patchCode);
     }
@@ -236,6 +334,87 @@ export async function reconcileStatusPatchesWithSap(userEmail, sapOrders = []) {
   );
   return data;
 }
+
+// FMS NUEVO - INICIO
+// Versión de SOLO LECTURA de la regla anterior: aplica los parches locales
+// vigentes sobre órdenes que llegaron de SAP sin borrar nada ni escribir en
+// caché. Sirve para pantallas que consultan SAP directamente (lista histórica,
+// detalle de una orden que no está en la caché de la ventana offline).
+// Si SAP ya alcanzó o superó el parche, la orden queda tal como la dio SAP.
+export async function overlayRecentStatusPatches(userEmail, orders = []) {
+  const list = Array.isArray(orders) ? orders : [];
+  if (!list.length) return list;
+
+  try {
+    const [patchMap, queueState] = await Promise.all([
+      getLocalStatusPatch(userEmail),
+      getSapQueueStatusState(),
+    ]);
+
+    if (!patchMap || !Object.keys(patchMap).length) return list;
+
+    const pendingOrderIds =
+      queueState?.pendingOrderIds instanceof Set
+        ? queueState.pendingOrderIds
+        : new Set(queueState?.pendingOrderIds || []);
+
+    // FMS ELIMINADO - INICIO
+    // Antes: el parche se buscaba por el número de orden EXACTO. Si SAP devolvía
+    // el mismo número con distintos ceros a la izquierda, el parche no se encontraba.
+    // return list.map((item) => {
+    //   const orderId = getOrderId(item);
+    //   const patch = orderId ? patchMap[orderId] : null;
+    //   if (!patch) return item;
+    //   const keep = shouldKeepPatch(
+    //     patch,
+    //     getEffectiveStatusCode(item),
+    //     pendingOrderIds.has(orderId),
+    //   );
+    //   return keep ? buildStatusFields(item, patch.estatus_code) : item;
+    // });
+    // FMS ELIMINADO - FIN
+
+    // FMS NUEVO - INICIO
+    // SAP puede devolver el número de orden con o sin ceros a la izquierda
+    // ("000040224775" vs "40224775"); se compara sin ceros iniciales.
+    const normalizeKey = (value) => {
+      const clean = String(value ?? "").trim();
+      return clean.replace(/^0+(?=\d)/, "") || (clean ? "0" : "");
+    };
+
+    const patchByKey = {};
+    Object.keys(patchMap).forEach((key) => {
+      patchByKey[normalizeKey(key)] = patchMap[key];
+    });
+
+    const pendingKeys = new Set(
+      Array.from(pendingOrderIds).map((value) => normalizeKey(value)),
+    );
+
+    return list.map((item) => {
+      const key = normalizeKey(getOrderId(item));
+      const patch = key ? patchByKey[key] : null;
+
+      if (!patch) return item;
+
+      const keep = shouldKeepPatch(
+        patch,
+        getEffectiveStatusCode(item),
+        pendingKeys.has(key),
+      );
+
+      return keep ? buildStatusFields(item, patch.estatus_code) : item;
+    });
+    // FMS NUEVO - FIN
+  } catch (error) {
+    console.log(
+      "[STATUS PATCH] No se pudo aplicar el parche de lectura:",
+      error?.message || error,
+    );
+    return list;
+  }
+}
+// FMS NUEVO - FIN
 
 export async function patchCacheOrdenesTecnicoList(userEmail, orderId, newStatusCode) {
   try {

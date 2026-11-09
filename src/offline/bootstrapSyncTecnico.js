@@ -11,6 +11,9 @@ import {
   isCacheFresh,
   ORDENES_CACHE_TTL_MS,
   MAX_DETAIL_CACHE_ITEMS,
+  // FMS NUEVO - INICIO
+  isOrderInWindow,
+  // FMS NUEVO - FIN
 } from "./ordenesTecnicoCache";
 
 import {
@@ -22,6 +25,9 @@ import {
 import { prefetchOrdenesTecnicoDetalles } from "./prefetchOrdenesTecnico";
 
 import api from "../services/api";
+// FMS NUEVO - INICIO
+import AsyncStorage from "@react-native-async-storage/async-storage";
+// FMS NUEVO - FIN
 
 /**
  * Normaliza las propiedades de cada orden.
@@ -433,6 +439,232 @@ function startDetailsPrefetch({
     });
 }
 
+
+
+// FMS NUEVO - INICIO
+/* =========================================================================
+   FASE 1 ("HOY"): lista del día + detalle completo, guardados ANTES de pedir
+   el rango. Si el rango tarda o falla, lo de hoy ya está en disco.
+   ========================================================================= */
+const TODAY_TTL_MS = 10 * 60 * 1000; // datos de hoy: refresco cada 10 min
+const TODAY_LIST_TIMEOUT_MS = 20000;
+const TODAY_DETAILS_MAX_WAIT_MS = 45000; // espera máxima del detalle antes del rango
+const TODAY_RETRY_MS = 20000; // un único reintento de lo que quede incompleto
+const RANGE_LIST_TIMEOUT_MS = 90000;
+// SOLO DESARROLLO: simula un rango lento (p. ej. 60000) para probar la fase 1.
+const DEBUG_DELAY_RANGE_MS = 0;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const localYmd = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate(),
+  ).padStart(2, "0")}`;
+
+const SYNC_META_KEY = (email) => `ordenesTecnico:syncPhases:${email}`;
+
+async function readSyncMeta(email) {
+  try {
+    const raw = await AsyncStorage.getItem(SYNC_META_KEY(email));
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeSyncMeta(email, patch) {
+  try {
+    const current = await readSyncMeta(email);
+    await AsyncStorage.setItem(
+      SYNC_META_KEY(email),
+      JSON.stringify({ ...current, ...patch }),
+    );
+  } catch {}
+}
+
+// Para que las pantallas recarguen cuando termina una fase en segundo plano.
+const syncListeners = new Set();
+
+export function subscribeBootstrapSync(listener) {
+  syncListeners.add(listener);
+  return () => syncListeners.delete(listener);
+}
+
+function emitSync(event) {
+  syncListeners.forEach((listener) => {
+    try {
+      listener(event);
+    } catch {}
+  });
+}
+
+let todayPhasePromise = null; // evita dos fases "hoy" simultáneas
+
+function refreshTodayPhase(email, { force = false, waitDetails = false } = {}) {
+  if (todayPhasePromise) return todayPhasePromise;
+
+  const promise = (async () => {
+    const t0 = Date.now();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = localYmd(today);
+
+    const meta = await readSyncMeta(email);
+    const stale =
+      force ||
+      meta.todayYmd !== todayStr ||
+      !isCacheFresh(meta.todayAt, TODAY_TTL_MS);
+
+        // FMS ELIMINADO - INICIO
+    // if (!stale) return { ran: false, ok: false, reason: "fresh" };
+    // if (!(await isOnline())) return { ran: false, ok: false, reason: "offline" };
+    // FMS ELIMINADO - FIN
+
+    // FMS NUEVO - INICIO
+    if (!stale) {
+      console.log("[BOOTSTRAP][HOY] Omitida: datos del día vigentes", {
+        haceSeg: Math.round((Date.now() - Number(meta.todayAt || 0)) / 1000),
+      });
+      return { ran: false, ok: false, reason: "fresh" };
+    }
+
+    if (!(await isOnline())) {
+      console.log("[BOOTSTRAP][HOY] Omitida: sin conexión");
+      return { ran: false, ok: false, reason: "offline" };
+    }
+    // FMS NUEVO - FIN
+
+    try {
+      const params = new URLSearchParams({
+        start: todayStr,
+        end: todayStr,
+        mode: "range",
+      });
+
+      console.log("[BOOTSTRAP][HOY] Consultando SAP:", { start: todayStr, end: todayStr });
+
+      const response = await api.get(`/api/ordenes/sap/list?${params.toString()}`, {
+        timeout: TODAY_LIST_TIMEOUT_MS,
+      });
+
+      const normalized = (Array.isArray(response?.data) ? response.data : [])
+        .map(normalizeOrdenFromList)
+        .filter(Boolean);
+
+      const todayOrders = filterOrdenesByWindow(normalized, today, today);
+      const effectiveToday = await reconcileStatusPatchesWithSap(email, todayOrders);
+
+      // Se reemplazan solo las órdenes de hoy; el resto de la lista no se toca.
+      const cached = await loadOrdenesTecnicoList(email);
+      const cachedList = Array.isArray(cached?.data) ? cached.data : [];
+      const todayWindow = { start: today, end: today };
+      const keepOthers = cachedList.filter((o) => !isOrderInWindow(o, todayWindow));
+      const merged = [...keepOthers, ...effectiveToday];
+
+      // updatedAt NO cambia: el rango sigue contando como "no sincronizado".
+      const saved = await saveOrdenesTecnicoList(
+        email,
+        merged,
+        buildOfflineWindow(new Date()),
+        Number(cached?.updatedAt) || 0,
+      );
+
+      await writeSyncMeta(email, { todayYmd: todayStr, todayAt: Date.now() });
+
+      console.log("[BOOTSTRAP][HOY] Lista del día guardada:", {
+        ordenes: effectiveToday.length,
+        saved,
+        ms: Date.now() - t0,
+      });
+
+      // Detalle completo de las órdenes de hoy (frescura de 10 min).
+      const ids = getOrderIds(effectiveToday);
+      const statusByOrderId = buildStatusByOrderId(effectiveToday);
+      let detailsPromise = Promise.resolve(null);
+
+      if (ids.length) {
+        detailsPromise = prefetchOrdenesTecnicoDetalles({
+          orderIds: ids,
+          statusByOrderId,
+          concurrency: 3,
+          force,
+          ttlMs: TODAY_TTL_MS,
+        })
+          .then((result) => {
+            console.log("[BOOTSTRAP][HOY] Detalles del día:", {
+              ok: result?.ok,
+              fresh: result?.fresh,
+              partial: result?.partial,
+              fail: result?.fail,
+              total: result?.total,
+              ms: Date.now() - t0,
+            });
+
+            // Un único reintento de lo que haya quedado incompleto.
+            if ((result?.partial || 0) + (result?.fail || 0) > 0) {
+              setTimeout(() => {
+                prefetchOrdenesTecnicoDetalles({
+                  orderIds: ids,
+                  statusByOrderId,
+                  concurrency: 2,
+                  force: true,
+                  ttlMs: TODAY_TTL_MS,
+                }).catch(() => {});
+              }, TODAY_RETRY_MS);
+            }
+
+            return result;
+          })
+          .catch((error) => {
+            console.log("[BOOTSTRAP][HOY] Error en detalles:", error?.message || error);
+            return null;
+          });
+      }
+
+      if (waitDetails) {
+        await Promise.race([detailsPromise, sleep(TODAY_DETAILS_MAX_WAIT_MS)]);
+      }
+
+      emitSync({ phase: "today", ok: true });
+
+      return {
+        ran: true,
+        ok: true,
+        data: merged,
+        todayOrders: effectiveToday,
+        ms: Date.now() - t0,
+      };
+    } catch (error) {
+      console.log(
+        "[BOOTSTRAP][HOY] Error consultando SAP:",
+        error?.response?.data || error?.message || error,
+      );
+      return { ran: true, ok: false, reason: "error" };
+    }
+  })().finally(() => {
+    todayPhasePromise = null;
+  });
+
+  todayPhasePromise = promise;
+  return promise;
+}
+
+// Si la fase "hoy" tuvo éxito, sus órdenes mandan sobre las del rango.
+function mergeTodayFirst(rangeOrders, todayPhase) {
+  if (!todayPhase?.ok || !Array.isArray(todayPhase.todayOrders)) return rangeOrders;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayWindow = { start: today, end: today };
+
+  return [
+    ...rangeOrders.filter((o) => !isOrderInWindow(o, todayWindow)),
+    ...todayPhase.todayOrders,
+  ];
+}
+// FMS NUEVO - FIN
+
 /**
  * Sincroniza las órdenes del técnico.
  *
@@ -498,25 +730,79 @@ export async function bootstrapPrefetchOrdenesTecnico(
    * Sin embargo, sí revisamos todos los detalles. Esto permite
    * continuar una precarga que haya quedado incompleta.
    */
-  if (!force && hasCachedList && cachedIsFresh) {
-    console.log(
-      "[BOOTSTRAP TECNICO] Usando caché vigente:",
-      {
-        count: cachedData.length,
-        updatedAt: cached?.updatedAt,
-      },
-    );
+  // if (!force && hasCachedList && cachedIsFresh) {
+  //   console.log(
+  //     "[BOOTSTRAP TECNICO] Usando caché vigente:",
+  //     {
+  //       count: cachedData.length,
+  //       updatedAt: cached?.updatedAt,
+  //     },
+  //   );
 
-    const orderIds = getOrderIds(cachedData);
-    const detailOrderIds = getDetailPrefetchOrderIds(cachedData);
-    const statusByOrderId = buildStatusByOrderId(cachedData);
+  //   const orderIds = getOrderIds(cachedData);
+  //   const detailOrderIds = getDetailPrefetchOrderIds(cachedData);
+  //   const statusByOrderId = buildStatusByOrderId(cachedData);
 
-    if (prefetchDetails) {
+  //   if (prefetchDetails) {
+  //     startDetailsPrefetch({
+  //       orderIds: detailOrderIds,
+  //       statusByOrderId,
+  //       ttlMs,
+  //       reason: "cache_fresh",
+  //     });
+  //   }
+
+  //   return {
+  //     ok: true,
+  //     reason: "cache_fresh",
+  //     source: "cache",
+  //     updatedAt: cached?.updatedAt || null,
+  //     count: cachedData.length,
+  //     data: cachedData,
+  //     orderIds,
+  //     window: cached?.window || null,
+  //   };
+  // }
+
+    if (!force && hasCachedList && cachedIsFresh) {
+    console.log("[BOOTSTRAP TECNICO] Usando caché vigente:", {
+      count: cachedData.length,
+      updatedAt: cached?.updatedAt,
+    });
+
+    // FMS NUEVO - INICIO
+    // Aunque el rango sea vigente (1 h), lo de HOY se refresca cada 10 min.
+    // Se espera como máximo 6 s la lista del día; si SAP tarda, continúa en
+    // segundo plano y se guarda sola, sin retrasar el arranque.
+    const todayPhase = await Promise.race([
+      refreshTodayPhase(cleanEmail, { force: false, waitDetails: false }),
+      sleep(6000).then(() => null),
+    ]);
+
+    const currentData = todayPhase?.ok
+      ? await applyLocalStatuses(cleanEmail, todayPhase.data)
+      : cachedData;
+    // FMS NUEVO - FIN
+
+    const orderIds = getOrderIds(currentData);
+    const detailOrderIds = getDetailPrefetchOrderIds(currentData);
+    const statusByOrderId = buildStatusByOrderId(currentData);
+
+       if (prefetchDetails) {
       startDetailsPrefetch({
         orderIds: detailOrderIds,
         statusByOrderId,
         ttlMs,
-        reason: "cache_fresh",
+        reason: "sap_updated",
+        // FMS ELIMINADO - INICIO
+        // force,
+        // FMS ELIMINADO - FIN
+        // FMS NUEVO - INICIO
+        // Recargar actualiza la lista y lo de hoy (fase 1). El resto de los
+        // detalles se renueva por vigencia (1 h); su estatus ya se corrige
+        // con la lista. Así no se repiten 120+ peticiones por cada Recargar.
+        force: false,
+        // FMS NUEVO - FIN
       });
     }
 
@@ -525,8 +811,8 @@ export async function bootstrapPrefetchOrdenesTecnico(
       reason: "cache_fresh",
       source: "cache",
       updatedAt: cached?.updatedAt || null,
-      count: cachedData.length,
-      data: cachedData,
+      count: currentData.length,
+      data: currentData,
       orderIds,
       window: cached?.window || null,
     };
@@ -568,6 +854,20 @@ export async function bootstrapPrefetchOrdenesTecnico(
    * Ventana offline:
    * 15 días anteriores y 1 días posteriores.
    */
+
+    // FMS NUEVO - INICIO
+  // Fase 1: hoy primero (espera la lista y hasta 45 s de detalle).
+  const todayPhase = await refreshTodayPhase(cleanEmail, {
+    force,
+    waitDetails: true,
+  });
+
+  if (__DEV__ && DEBUG_DELAY_RANGE_MS > 0) {
+    console.log("[BOOTSTRAP][RANGO] Retraso de prueba:", DEBUG_DELAY_RANGE_MS);
+    await sleep(DEBUG_DELAY_RANGE_MS);
+  }
+  // FMS NUEVO - FIN
+
   const window = buildOfflineWindow(new Date());
 
   const params = new URLSearchParams({
@@ -590,9 +890,15 @@ export async function bootstrapPrefetchOrdenesTecnico(
      * No enviamos el usuario por query.
      * El backend obtiene el correo desde el token Azure.
      */
+    // FMS ELIMINADO - INICIO
+    // const response = await api.get(`/api/ordenes/sap/list?${params.toString()}`);
+    // FMS ELIMINADO - FIN
+    // FMS NUEVO - INICIO
     const response = await api.get(
       `/api/ordenes/sap/list?${params.toString()}`,
+      { timeout: RANGE_LIST_TIMEOUT_MS },
     );
+    // FMS NUEVO - FIN
 
     const rawRows = Array.isArray(response?.data)
       ? response.data
@@ -618,10 +924,17 @@ export async function bootstrapPrefetchOrdenesTecnico(
      * Solo un cambio todavía pendiente o dentro de la breve gracia
      * posterior al envío puede conservar prioridad sobre SAP.
      */
-    const effectiveOrders = await reconcileStatusPatchesWithSap(
+        // FMS ELIMINADO - INICIO
+    // const effectiveOrders = await reconcileStatusPatchesWithSap(cleanEmail, sapOrdersInWindow);
+    // FMS ELIMINADO - FIN
+
+    // FMS NUEVO - INICIO
+    const reconciledRangeOrders = await reconcileStatusPatchesWithSap(
       cleanEmail,
       sapOrdersInWindow,
     );
+    const effectiveOrders = mergeTodayFirst(reconciledRangeOrders, todayPhase);
+    // FMS NUEVO - FIN
 
     const orderIds = getOrderIds(effectiveOrders);
 
@@ -642,6 +955,11 @@ export async function bootstrapPrefetchOrdenesTecnico(
       effectiveOrders,
       window,
     );
+
+        // FMS NUEVO - INICIO
+    await writeSyncMeta(cleanEmail, { rangeAt: Date.now() });
+    emitSync({ phase: "range", ok: true });
+    // FMS NUEVO - FIN
 
     /*
      * Conserva exactamente el estatus efectivo que acaba de quedar en
@@ -690,6 +1008,12 @@ export async function bootstrapPrefetchOrdenesTecnico(
       window,
     };
   } catch (error) {
+
+        // FMS NUEVO - INICIO
+    const cachedDataForError = todayPhase?.ok
+      ? await applyLocalStatuses(cleanEmail, todayPhase.data)
+      : cachedData;
+    // FMS NUEVO - FIN
     /*
      * Si SAP o la API fallan, conservamos la lista anterior
      * y también conservamos sus estatus locales.

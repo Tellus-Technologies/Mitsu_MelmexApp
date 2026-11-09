@@ -91,6 +91,41 @@ export async function mergeConsumiblesPair({
   return true;
 }
 
+
+// FMS NUEVO - INICIO
+// Guarda VARIOS grupos en una sola lectura y una sola escritura.
+// updates: [{ coverageKeys: ["BASICA","MEDIA"], agr1, agr2, materials }]
+export async function mergeConsumiblesBatch(updates = []) {
+  const current = await loadConsumiblesCatalogo();
+  const nextData = { ...(current?.data || {}) };
+  const cloned = new Set();
+
+  for (const u of Array.isArray(updates) ? updates : []) {
+    const a1 = safeStr(u?.agr1).toUpperCase();
+    const a2 = safeStr(u?.agr2).toUpperCase();
+    if (!a1 || !a2) continue;
+
+    const pk = pairKey(a1, a2);
+    const materials = normalizeMaterialsList(u?.materials, a1, a2);
+
+    for (const rawCov of u?.coverageKeys || []) {
+      const cov = safeStr(rawCov).toUpperCase();
+      if (!cov) continue;
+
+      if (!cloned.has(cov)) {
+        nextData[cov] = { ...(nextData[cov] || {}) };
+        cloned.add(cov);
+      }
+
+      nextData[cov][pk] = materials;
+    }
+  }
+
+  await saveConsumiblesCatalogo(nextData);
+  return true;
+}
+// FMS NUEVO - FIN
+
 export async function getConsumiblesByPair({ coverageKey, agr1, agr2 }) {
   try {
     const cov = safeStr(coverageKey).toUpperCase();

@@ -922,7 +922,26 @@ export async function upsertSapQueueItem({
           ) === item.dedupeKey,
       );
 
-      if (index >= 0) {
+      // if (index >= 0) {
+      //   const previous = queue[index];
+
+      //   const oldUris =
+      //     collectLocalFileUris(
+      //       previous?.payload,
+      //     );
+
+      //   queue[index] = {
+      //     ...previous,
+      //     ...item,
+      //     id: previous.id,
+      //     createdAt: previous.createdAt,
+      //     tries: 0,
+      //     syncState: SYNC_STATE_PENDING,
+      //     lastError: null,
+      //   };
+
+
+            if (index >= 0) {
         const previous = queue[index];
 
         const oldUris =
@@ -930,9 +949,23 @@ export async function upsertSapQueueItem({
             previous?.payload,
           );
 
+        // FMS NUEVO - INICIO
+        // Reencolar la misma operación conserva el BulkId del paquete anterior,
+        // para que SAP o ZLOG_ORD_BULK puedan reconocerla como repetida.
+        const previousBulkId = previous?.payload?.BulkId;
+
+        const keptPayload =
+          previousBulkId && item?.payload && typeof item.payload === "object"
+            ? { ...item.payload, BulkId: previousBulkId }
+            : item.payload;
+        // FMS NUEVO - FIN
+
         queue[index] = {
           ...previous,
           ...item,
+          // FMS NUEVO - INICIO
+          payload: keptPayload,
+          // FMS NUEVO - FIN
           id: previous.id,
           createdAt: previous.createdAt,
           tries: 0,
@@ -1090,7 +1123,76 @@ export async function retrySapQueueItemById(itemId) {
   };
 }
 
-export async function processSapQueue({
+// Espaciado entre paquetes de la MISMA orden. SAP responde 201 enseguida y
+// procesa en segundo plano; un segundo paquete de la misma orden que llegue
+// mientras el primero se procesa se rechaza con "la orden se está tratando".
+const SAME_ORDER_GAP_MS = 9000;
+const lastBulkPostByOrder = new Map(); // orden -> hora del último POST masivo
+
+const normOrderKey = (v) =>
+  String(v ?? "").trim().replace(/^0+(?=\d)/, "");
+
+// Solo los paquetes masivos comparten la tarea en segundo plano de SAP.
+function bulkOrderKeyOf(item, sendPayload, endpoint) {
+  // FMS NUEVO - INICIO (SOLO DIAGNÓSTICO DE ORDEN)
+  console.log("[SAP QUEUE][ORDEN POST]", {
+    hora: new Date().toISOString().slice(11, 23),
+    tipo: item?.type,
+    orden: item?.orderId,
+    bulkId: sendPayload?.BulkId,
+    creado: item?.createdAt,
+    endpoint: String(endpoint || "").split("/").pop(),
+  });
+  // FMS NUEVO - FIN
+  if (!String(endpoint || "").includes("WorkOrderBulkSet")) return "";
+
+  const fromBody =
+    sendPayload?.WorkOrderSet?.[0]?.OrderId ??
+    sendPayload?.WorkOrderSet?.[0]?.WorkOrderHeader?.Orderid;
+
+  return normOrderKey(fromBody || item?.orderId);
+}
+
+async function waitForOrderGap(orderKey) {
+  if (!orderKey) return;
+  const last = lastBulkPostByOrder.get(orderKey) || 0;
+  const wait = last + SAME_ORDER_GAP_MS - Date.now();
+  if (wait > 0) {
+    console.log("[SAP QUEUE] Espaciando paquetes de la misma orden:", {
+      orden: orderKey,
+      esperaMs: wait,
+    });
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+}
+
+// Una sola ejecución a la vez. Si alguien la pide mientras corre, se repite al
+// terminar para recoger lo que se haya encolado entretanto. Evita que varias
+// pantallas envíen el mismo elemento a la vez.
+let sapQueueRun = null;
+let sapQueueRerun = false;
+
+export function processSapQueue(options) {
+  if (sapQueueRun) {
+    sapQueueRerun = true;
+    return sapQueueRun;
+  }
+
+  sapQueueRun = (async () => {
+    let result;
+    do {
+      sapQueueRerun = false;
+      result = await processSapQueueOnce(options);
+    } while (sapQueueRerun);
+    return result;
+  })().finally(() => {
+    sapQueueRun = null;
+  });
+
+  return sapQueueRun;
+}
+
+async function processSapQueueOnce({
   ensureValidToken,
   apiInstance,
 } = {}) {
@@ -1307,10 +1409,13 @@ export async function processSapQueue({
             sendPayload?.Attachments,
           )
         ) {
+          const gapKey = bulkOrderKeyOf(item, sendPayload, endpoint);
+          await waitForOrderGap(gapKey);
           await apiInstance.post(
             endpoint,
             sendPayload,
           );
+          if (gapKey) lastBulkPostByOrder.set(gapKey, Date.now());
         } else {
           const attachmentEndpoint =
             safeStr(
@@ -1369,10 +1474,13 @@ export async function processSapQueue({
         }
 
         if (method === "post") {
+          const gapKey = bulkOrderKeyOf(item, sendPayload, endpoint);
+          await waitForOrderGap(gapKey);
           await apiInstance.post(
             endpoint,
             sendPayload,
           );
+          if (gapKey) lastBulkPostByOrder.set(gapKey, Date.now());
         } else if (
           method === "patch"
         ) {

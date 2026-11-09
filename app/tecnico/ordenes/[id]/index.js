@@ -38,7 +38,17 @@ import {
   setLocalStatusPatch,
   patchCacheOrdenesTecnicoList,
   patchCacheOrdenTecnicoDetail,
+  // FMS NUEVO - INICIO
+  overlayRecentStatusPatches,
+  markLocalStatusPatchSent,
+  // FMS NUEVO - FIN
 } from "../../../../src/offline/ordenesTecnicoLocalPatch";
+
+// FMS NUEVO - INICIO
+import { scheduleStatusConfirmation } from "../../../../src/offline/statusConfirmation";
+// FMS NUEVO - FIN
+
+
 
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -1111,7 +1121,15 @@ async function hasOfflineQueuedCheckin(userEmail, orderId) {
   }
 }
 
-const BG_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutos
+// FMS ELIMINADO - INICIO
+// const BG_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutos
+// FMS ELIMINADO - FIN
+
+// FMS NUEVO - INICIO
+// Con señal débil el técnico no debe esperar minutos: pasado este tiempo el
+// envío se guarda en la cola y se reintenta solo.
+const BG_TIMEOUT_MS = 45 * 1000;
+// FMS NUEVO - FIN
 
 function isTimeoutError(error) {
   const msg = String(error?.message || "").toLowerCase();
@@ -1162,6 +1180,51 @@ async function postWithBackgroundFallback({
     throw error;
   }
 }
+
+
+// FMS NUEVO - INICIO
+// Copia el PDF a un archivo propio de la cola (mismo marcador que usa el TBM/KY).
+// La cola lo lee al enviar y borra la copia al terminar.
+const QUEUE_FILES_FOLDER = "sap_queue_files/";
+const QUEUE_FILE_MARKER = "__sapQueueLocalFileV1";
+
+async function prepararPdfFinalizacionParaCola(uriPdf, orderId) {
+  if (!FileSystem.documentDirectory) {
+    throw new Error("No hay almacenamiento local para encolar la finalización.");
+  }
+
+  const info = await FileSystem.getInfoAsync(uriPdf);
+  if (!info.exists || (typeof info.size === "number" && info.size < 200)) {
+    throw new Error("El archivo PDF de la finalización no existe o está incompleto.");
+  }
+
+  const carpeta = `${FileSystem.documentDirectory}${QUEUE_FILES_FOLDER}`;
+  const infoCarpeta = await FileSystem.getInfoAsync(carpeta);
+  if (!infoCarpeta.exists) {
+    await FileSystem.makeDirectoryAsync(carpeta, { intermediates: true });
+  }
+
+  const orderSafe = String(orderId || "orden").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const destino = `${carpeta}finalizacion_${orderSafe}_${Date.now()}_${Math.random()
+    .toString(16)
+    .slice(2)}.pdf`;
+
+  await FileSystem.copyAsync({ from: uriPdf, to: destino });
+
+  const copiado = await FileSystem.getInfoAsync(destino);
+  if (!copiado.exists || (typeof copiado.size === "number" && copiado.size < 200)) {
+    throw new Error("No se pudo conservar el PDF para el envío en segundo plano.");
+  }
+
+  return {
+    [QUEUE_FILE_MARKER]: true,
+    uri: destino,
+    dataUrlPrefix: "",
+    createdAt: Date.now(),
+  };
+}
+// FMS NUEVO - FIN
+
 
 function hasValidConsumibles(consumiblesRows) {
   const rows = Array.isArray(consumiblesRows) ? consumiblesRows : [];
@@ -1958,6 +2021,8 @@ export default function DetalleOrden() {
         net?.isConnected && net?.isInternetReachable !== false
       );
 
+      // FMS NUEVO - FIN
+
       if (!isOnline) {
         if (!cached?.data) {
           Alert.alert(
@@ -1986,7 +2051,26 @@ export default function DetalleOrden() {
       });
 
       const resOrden = await api.get(`/api/ordenes/sap/${orderIdParam}`);
-      const baseOrden = resOrden.data || {};
+      // FMS ELIMINADO - INICIO
+      // const baseOrden = resOrden.data || {};
+      // FMS ELIMINADO - FIN
+
+      // FMS NUEVO - INICIO
+      // SAP procesa los paquetes en segundo plano y puede seguir devolviendo
+      // el estatus anterior. Se aplica el parche local vigente (por ejemplo
+      // el check-in recién enviado) para que el detalle muestre el siguiente paso.
+      const baseOrdenSap = resOrden.data || {};
+      const baseParaParche =
+        baseOrdenSap?.Orderid || baseOrdenSap?.OrderId || baseOrdenSap?.orderid
+          ? baseOrdenSap
+          : { ...baseOrdenSap, Orderid: orderIdParam };
+      const [baseOrden] = await overlayRecentStatusPatches(userEmail, [
+        baseParaParche,
+      ]);
+      // FMS NUEVO - FIN
+      const resetBySap = await reconciliarCronometroConSap(
+        String(baseOrden?.Orderid || orderIdParam), baseOrden,
+      );
 
       let shortTextHeader = "";
       try {
@@ -2707,7 +2791,12 @@ export default function DetalleOrden() {
         net?.isConnected && net?.isInternetReachable !== false
       );
 
-      if (!isOnline) {
+      // FMS NUEVO - INICIO
+      // Siempre se guarda primero (cola + estatus local); el envío ocurre en
+      // segundo plano. Para volver al envío directo, poner queueFirst0400 = false.
+      const queueFirst0400 = true;
+      if (queueFirst0400 || !isOnline) {
+      // FMS NUEVO - FIN
         await enqueueSap({
           type: "CONFIRMATIONS",
           orderId,
@@ -2732,15 +2821,43 @@ export default function DetalleOrden() {
 
         await applyLocalOrderStatus(orderId, "0400");
 
+                // FMS NUEVO - INICIO
+        if (isOnline) {
+          // El envío arranca de inmediato, sin que el técnico lo espere.
+          Promise.resolve(
+            processSapQueue({ ensureValidToken, apiInstance: api }),
+          )
+            .then(async (r) => {
+              console.log("[0400][QUEUE] Resultado:", {
+                ok: r?.ok,
+                processed: r?.processed,
+                remaining: r?.remaining,
+              });
+
+              if (r?.ok && r?.remaining === 0) {
+                await markLocalStatusPatchSent(userEmail, orderId);
+                scheduleStatusConfirmation({ userEmail, orderId });
+              }
+            })
+            .catch((e) =>
+              console.log("[0400][QUEUE] Error:", e?.message || e),
+            );
+        }
+        // FMS NUEVO - FIN
+
         Alert.alert(
-          "Guardado offline",
-          "La orden quedó en pendiente de firma. Las operaciones/consumibles y el estatus 0400 se enviarán cuando vuelva el internet.",
+          isOnline ? "Guardado" : "Guardado offline",
+          isOnline
+            ? "La orden quedó en pendiente de firma. Las operaciones y el estatus se están enviando a SAP en segundo plano."
+            : "La orden quedó en pendiente de firma. Las operaciones/consumibles y el estatus 0400 se enviarán cuando vuelva el internet.",
         );
 
         setFinalizeMode(false);
         router.replace("/tecnico/ordenes");
         return;
       }
+
+
       //////////////////////////////////////
 
       ///////////////////////////////////////////////////////////////
@@ -3389,10 +3506,36 @@ export default function DetalleOrden() {
     const workOrderBulkEndpoint =
       "/api/odata/ZCS_CHANGE_WORKORDER_SRV/WorkOrderBulkSet";
 
+    // Leer el PDF únicamente cuando el técnico confirma la finalización.
+    // Si el archivo no existe, NO cambiar SAP ni perder el respaldo local.
+        // FMS NUEVO - INICIO
+    // El PDF NO se lee a Base64 en memoria: se copia a un archivo de la cola y el
+    // paquete lleva solo una referencia. La cola lo lee al enviar.
+    let pdfLocalRef;
+    try {
+      if (!pdfUri) throw new Error("No hay archivo PDF preparado.");
+      pdfLocalRef = await prepararPdfFinalizacionParaCola(pdfUri, orderId);
+    } catch (error) {
+      Alert.alert(
+        "No se pudo preparar el PDF",
+        error?.message || "Intenta generar el documento nuevamente.",
+      );
+      return;
+    }
+
+    const change0300PayloadConPdf = {
+      ...change0300WithPdfPayload,
+      Attachments: (change0300WithPdfPayload.Attachments || []).map(
+        (archivo, indice) =>
+          indice === 0 ? { ...archivo, Base64: pdfLocalRef } : archivo,
+      ),
+    };
+
     const change0300BulkPayload = buildSingleWorkOrderBulkPayload({
       orderId,
-      workOrderPayload: change0300WithPdfPayload,
+      workOrderPayload: change0300PayloadConPdf,
     });
+    // FMS NUEVO - FIN
 
     console.log("[DETALLE_ORDEN][BULK_ID]", {
       BulkId: change0300BulkPayload.BulkId,
@@ -3431,7 +3574,7 @@ export default function DetalleOrden() {
       );
       console.log("CONFIRMATIONS alreadySent:", alreadySentConfirmations);
 
-      if (!change0300WithPdfPayload?.Attachments?.[0]?.Base64) {
+      if (!change0300PayloadConPdf?.Attachments?.[0]?.Base64) {
         Alert.alert(
           "No se pudo generar el PDF",
           "No se pudo generar el PDF en este dispositivo. Intenta de nuevo o revisa permisos/almacenamiento.",
@@ -3439,7 +3582,14 @@ export default function DetalleOrden() {
         return;
       }
 
-      if (!isOnline) {
+            // FMS ELIMINADO - INICIO
+      // if (!isOnline) {
+      // FMS ELIMINADO - FIN
+
+      // FMS NUEVO - INICIO
+      const queueFirstFinalizacion = true;
+      if (queueFirstFinalizacion || !isOnline) {
+      // FMS NUEVO - FIN
         await updateLocalOpsAsFinalizadas(orderId, selectedIds);
         await updateLocalOrderAsFinalizada0300(orderId, finishMs);
 
@@ -3478,11 +3628,38 @@ export default function DetalleOrden() {
         setShowMantPreview(false);
         setPendingFinalize(null);
 
-        Alert.alert(
-          "Finalizado (offline)",
-          alreadySentConfirmations
-            ? "Se encoló (Estatus 0300+PDF). Confirmaciones+consumibles ya se habían enviado en 0400."
-            : "Se encoló: (Estatus 0300+PDF) + confirmaciones+consumibles.",
+
+                // FMS NUEVO - INICIO
+        if (isOnline) {
+          Promise.resolve(
+            processSapQueue({ ensureValidToken, apiInstance: api }),
+          )
+            .then(async (r) => {
+              console.log("[0300][QUEUE] Resultado:", {
+                ok: r?.ok,
+                processed: r?.processed,
+                remaining: r?.remaining,
+              });
+
+              if (r?.ok && r?.remaining === 0) {
+                await markLocalStatusPatchSent(userEmail, orderId);
+                scheduleStatusConfirmation({ userEmail, orderId });
+              }
+            })
+            .catch((e) =>
+              console.log("[0300][QUEUE] Error:", e?.message || e),
+            );
+        }
+        // FMS NUEVO - FIN
+
+
+                Alert.alert(
+          isOnline ? "Finalizado" : "Finalizado (offline)",
+          isOnline
+            ? "La orden quedó finalizada. El estatus 0300 y el PDF se están enviando a SAP en segundo plano."
+            : alreadySentConfirmations
+              ? "Se encoló (Estatus 0300+PDF). Confirmaciones+consumibles ya se habían enviado en 0400."
+              : "Se encoló: (Estatus 0300+PDF) + confirmaciones+consumibles.",
         );
 
         router.replace("/tecnico/ordenes");
@@ -3885,6 +4062,35 @@ export default function DetalleOrden() {
           />
         }
       />
+
+      {/* FMS NUEVO - INICIO: botón Crear aviso reactivado */}
+      <TouchableOpacity
+        style={styles.fab}
+        activeOpacity={0.85}
+        onPress={() => {
+          const orderId = String(orden?.Orderid || id || "").trim();
+
+          if (!orderId) {
+            Alert.alert("Error", "No se encontró el número de orden.");
+            return;
+          }
+
+          router.push({
+            pathname: "/tecnico/ordenes/[orderid]/aviso-averia",
+            params: { orderid: orderId },
+          });
+        }}
+      >
+        <Ionicons
+          name="warning-outline"
+          size={19}
+          color="#000"
+        />
+        <Text style={styles.fabLabel}>
+          Crear aviso
+        </Text>
+      </TouchableOpacity>
+      {/* FMS NUEVO - FIN */}
 
       <ModalesDetalleOrden
         styles={styles}
