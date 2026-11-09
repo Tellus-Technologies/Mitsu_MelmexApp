@@ -82,6 +82,27 @@ function datePlusDays(hour = 8, minute = 0, plusDays = 0) {
   return d;
 }
 
+/** 🧠 Calcula inteligentemente qué piezas del técnico aún no han sido seleccionadas */
+const obtenerPiezasPendientesDeSugerir = (opComponentes, piezasAviso) => {
+  if (!piezasAviso || piezasAviso.length === 0) return [];
+
+  const elegidasEnOp = (opComponentes || [])
+    .filter((c) => c.NotFound && (c.MultiSelected || []).length > 0)
+    .map((c) => String(c.MultiSelected[0].Descripcion || "").toLowerCase());
+
+  return piezasAviso.filter((pieza) => {
+    const pLower = pieza.toLowerCase();
+    const palabrasPieza = pLower.split(/\s+/).filter(w => w.length > 2);
+
+    const yaFueElegida = elegidasEnOp.some((descElegida) => {
+      if (descElegida.includes(pLower)) return true;
+      return palabrasPieza.some((palabra) => descElegida.includes(palabra));
+    });
+
+    return !yaFueElegida;
+  });
+};
+
 function normActivity(n) {
   const v = Number(n);
   const act = Number.isFinite(v) ? v : 10;
@@ -89,20 +110,11 @@ function normActivity(n) {
 }
 
 function normItemNumberByIndex(index) {
-  // 1->0010, 2->0020, 3->0030...
   return String((index + 1) * 10).padStart(4, "0");
 }
 
-/**
- * ✅ Extrae OrderId, Aviso y Oferta del Return:
- * - Orden = MessageV2 (típico IWO_BAPI2/126)
- * - Aviso = MessageV3 (típico IWO_BAPI2/126)
- * - Oferta = desde mensaje "Oferta creada: XXXXX" (típico ZSD/002)
- * - Fallbacks: regex desde Message
- */
 function extractOrderFromReturn(dataOrD) {
   const d = dataOrD?.d ? dataOrD.d : dataOrD;
-
   const returns = d?.Return?.results || d?.ReturnSet?.results || [];
   if (!Array.isArray(returns) || returns.length === 0) {
     return {
@@ -127,13 +139,11 @@ function extractOrderFromReturn(dataOrD) {
   const errors = returns.filter(isError);
   const warnings = returns.filter(isWarning);
 
-  // ✅ mensajes de éxito (para mostrar en UI si quieres)
   const successMessages = returns
     .filter(isSuccess)
     .map((r) => String(r?.Message || "").trim())
     .filter(Boolean);
 
-  // ✅ renglón típico de creación de orden (OrderId y Aviso)
   const successItem =
     returns.find(
       (r) =>
@@ -161,7 +171,6 @@ function extractOrderFromReturn(dataOrD) {
     ? String(successItem.MessageV3).trim()
     : null;
 
-  // ✅ Oferta creada (ZSD o texto "Oferta creada")
   const offerItem =
     returns.find(
       (r) =>
@@ -178,17 +187,14 @@ function extractOrderFromReturn(dataOrD) {
 
   let offerNo = null;
   if (offerMessage) {
-    // Caso ideal: "Oferta creada: 0020000114"
     const m = offerMessage.match(/oferta creada:\s*([0-9]+)/i);
     if (m?.[1]) offerNo = m[1];
-    // Fallback: primer número largo
     if (!offerNo) {
       const nums = offerMessage.match(/\b\d{6,15}\b/g) || [];
       offerNo = nums[0] || null;
     }
   }
 
-  // Fallback por texto para orderId/notifNo si no vinieron en V2/V3
   if ((!orderId || !notifNo) && message) {
     const numbers = message.match(/\b\d{6,12}\b/g) || [];
     if (!orderId && numbers.length >= 1) orderId = numbers[0];
@@ -209,9 +215,6 @@ function extractOrderFromReturn(dataOrD) {
   };
 }
 
-/**
- * ✅ Fallback: extrae #orden / #aviso desde sap-message header.
- */
 function extractFromSapMessageHeader(headers) {
   const h = headers || {};
   const raw = h["sap-message"] || h["SAP-MESSAGE"] || h["Sap-Message"] || null;
@@ -229,55 +232,42 @@ function extractFromSapMessageHeader(headers) {
   }
 }
 
-// ✅ TEMP: equipo fijo para BOM (Intrm)
 const FIXED_INTRM_FOR_BOM = "MX06GR478NL3-10P";
 
-/** ===================== MODELOS ===================== */
 function emptyComponent(itemNumber, planPlant, activity) {
   return {
     ItemNumber: String(itemNumber).padStart(4, "0"),
     Activity: String(activity || "0010").padStart(4, "0"),
-
     Category: "",
     Materials: [],
     LoadingMaterials: false,
-
     Material: "",
     RequirementQuantity: "",
     StgeLoc: "",
     Plant: planPlant,
-
-    Trackingno: "03", // normal direct 03
-
+    Trackingno: "01",
     NotFound: false,
     NotFoundCategories: [],
     LoadingNotFoundCategories: false,
     NotFoundCategory: "",
     NotFoundMaterials: [],
     LoadingNotFoundMaterials: false,
-
-    // ✅ antes era multi; ahora limitamos a 1 (guardado como array de 0/1 para no romper payload)
     MultiSelected: [],
-    MultiTrackingno: "02",
+    MultiTrackingno: "01",
   };
 }
 
 function emptyOperation(index, planPlant) {
-  const activity = normActivity((index + 1) * 10); // 0010,0020...
+  const activity = normActivity((index + 1) * 10);
   return {
     Activity: activity,
     Description: "",
     DurationNormal: "",
     IsExternal: false,
-    Components: [emptyComponent("0010", planPlant, activity)],
+    Components: [],
   };
 }
 
-/** ✅ Normaliza operaciones y componentes:
- * - operaciones: 0010,0020,0030...
- * - components ItemNumber: 0010,0020,0030... (en orden)
- * - component Activity siempre igual a la Activity de la operación
- */
 function normalizeOpsAndComponents(list, planPlant) {
   return (list || []).map((op, opIdx) => {
     const act = normActivity((opIdx + 1) * 10);
@@ -295,47 +285,60 @@ function normalizeOpsAndComponents(list, planPlant) {
 }
 
 export default function CrearOrdenMantto() {
-  const { averiaid, notifNo, equipment, MaterialLong, shortText } =
-    useLocalSearchParams();
+  const params = useLocalSearchParams();
+  const { averiaid, notifNo, equipment, MaterialLong, shortText, ubicacionObjetoFalla } = params;
+  const bomCacheRef = React.useRef({});
+  const [expandedOpIndex, setExpandedOpIndex] = useState(0);
+  const scrollViewRef = React.useRef(null);
+  const scrollToBottom = () => {
+    setTimeout(() => {
+      scrollViewRef.current?.scrollToEnd({ animated: true });
+    }, 250); // Un pequeño retraso para asegurar que el teclado o el renderizado terminen
+  };
+
+  const [step, setStep] = useState(1);
+
+  const piezasAviso = useMemo(() => {
+    try {
+      return params?.piezas ? JSON.parse(params.piezas) : [];
+    } catch (e) {
+      return [];
+    }
+  }, [params?.piezas]);
 
   const [orderType] = useState("SM01");
   const [planPlant] = useState("TLP1");
 
-  // ✅ Fechas como Date (picker), pero se mandan formateadas
   const [startDT, setStartDT] = useState(datePlusDays(8, 0, 0));
   const [finishDT, setFinishDT] = useState(datePlusDays(18, 0, 1));
-
-  // ✅ 1) ShortText de la orden VACÍO por defecto
   const [headerShortText, setHeaderShortText] = useState("");
 
-  // Work centres (técnicos)
-  const [workCenters, setWorkCenters] = useState([]);
-  const [loadingWorkCenters, setLoadingWorkCenters] = useState(false);
-  const [selectedWorkCenter, setSelectedWorkCenter] = useState(null); // { Arbpl, Ktext }
-
-  // ✅ Operaciones con materiales
   const [operations, setOperations] = useState(() =>
     normalizeOpsAndComponents([emptyOperation(0, planPlant)], planPlant),
   );
 
   const [saving, setSaving] = useState(false);
+  const [payloadPreview, setPayloadPreview] = useState(null);
 
-  // Multi select modal (para un componente de UNA operación)
   const [multiVisible, setMultiVisible] = useState(false);
   const [multiOpIndex, setMultiOpIndex] = useState(-1);
   const [multiCompIndex, setMultiCompIndex] = useState(-1);
   const [multiQuery, setMultiQuery] = useState("");
 
-  // ✅ Picker state (fecha/hora)
   const [dtPickerVisible, setDtPickerVisible] = useState(false);
-  const [dtPickerField, setDtPickerField] = useState(null); // "start" | "finish"
-  const [dtPickerStep, setDtPickerStep] = useState("date"); // android: "date" -> "time"
+  const [dtPickerField, setDtPickerField] = useState(null);
+  const [dtPickerStep, setDtPickerStep] = useState("date");
   const [dtPickerTemp, setDtPickerTemp] = useState(new Date());
 
-  // ✅ Personas (solo UI por ahora)
   const [peopleCount, setPeopleCount] = useState(null);
 
-  const goBack = () => router.back();
+  const goBack = () => {
+    if (step > 1) {
+      setStep(step - 1);
+    } else {
+      router.back();
+    }
+  };
 
   const startDateStr = useMemo(() => toIsoLocalFromDate(startDT), [startDT]);
   const finishDateStr = useMemo(() => toIsoLocalFromDate(finishDT), [finishDT]);
@@ -354,40 +357,6 @@ export default function CrearOrdenMantto() {
     if (dtPickerField === "finish") setFinishDT(finalDate);
   };
 
-  // ==== Cargar WorkCentreSet ====
-  useEffect(() => {
-    const fetchWorkCenters = async () => {
-      try {
-        setLoadingWorkCenters(true);
-
-        const url =
-          "https://my-node-api-qas-01.cfapps.us10-001.hana.ondemand.com/api/odata/ZSD_CATALOGOS_SRV/WorkCentreSet?$format=json";
-
-        const res = await fetch(url);
-        const json = await res.json();
-        const list = json?.d?.results ?? json?.value ?? [];
-
-        const mapped = list.map((it) => ({
-          Arbpl: it.Arbpl,
-          Ktext: it.Ktext,
-        }));
-
-        setWorkCenters(mapped);
-      } catch (err) {
-        console.error("Error al cargar WorkCentreSet:", err);
-        Alert.alert(
-          "Catálogo de técnicos",
-          "No se pudo cargar la lista de centros de trabajo.",
-        );
-      } finally {
-        setLoadingWorkCenters(false);
-      }
-    };
-
-    fetchWorkCenters();
-  }, []);
-
-  /** ===================== HELPERS OPERACIONES ===================== */
   const updateOperation = (opIndex, field, value) => {
     setOperations((prev) =>
       prev.map((op, i) => (i === opIndex ? { ...op, [field]: value } : op)),
@@ -397,7 +366,9 @@ export default function CrearOrdenMantto() {
   const addOperation = () => {
     setOperations((prev) => {
       const next = [...prev, emptyOperation(prev.length, planPlant)];
-      return normalizeOpsAndComponents(next, planPlant);
+      const normalized = normalizeOpsAndComponents(next, planPlant);
+      setExpandedOpIndex(normalized.length - 1); //  Colapsa las anteriores y abre la nueva recién creada
+      return normalized;
     });
   };
 
@@ -415,7 +386,6 @@ export default function CrearOrdenMantto() {
     });
   };
 
-  /** ===================== HELPERS COMPONENTES POR OPERACIÓN ===================== */
   const updateComponent = (opIndex, compIndex, field, value) => {
     setOperations((prev) => {
       const next = prev.map((op, i) => {
@@ -424,17 +394,6 @@ export default function CrearOrdenMantto() {
           j === compIndex ? { ...c, [field]: value } : c,
         );
         return { ...op, Components: comps };
-      });
-      return normalizeOpsAndComponents(next, planPlant);
-    });
-  };
-
-  const addComponentToOp = (opIndex) => {
-    setOperations((prev) => {
-      const next = prev.map((op, i) => {
-        if (i !== opIndex) return op;
-        const newComp = emptyComponent("0010", planPlant, op.Activity);
-        return { ...op, Components: [...(op.Components || []), newComp] };
       });
       return normalizeOpsAndComponents(next, planPlant);
     });
@@ -458,16 +417,10 @@ export default function CrearOrdenMantto() {
     });
   };
 
-  /** ============================
-   *  ✅ NOT FOUND: Categorías + BOM
-   *  ============================ */
   const fetchNotFoundCategories = async () => {
     const url = "/api/odata/ZSD_CATALOGOS_SRV/CategoriaManttoSet?$format=json";
-    console.log("[CategoriaManttoSet] GET", url);
-
     const res = await api.get(url, { headers: { Accept: "application/json" } });
     const data = res?.data?.d?.results ?? res?.data?.value ?? [];
-    console.log("[CategoriaManttoSet] rows:", data.length);
 
     const mapped = data
       .map((x) => {
@@ -485,33 +438,45 @@ export default function CrearOrdenMantto() {
     return Array.from(uniq.values());
   };
 
-  const fetchNotFoundBomItems = async ({ equipmentIntrm, zeinr }) => {
+  const fetchNotFoundBomItems = async ({ equipmentIntrm, zeinr, werks }) => {
     const eq = FIXED_INTRM_FOR_BOM;
     const cat = String(zeinr || "").trim();
+    const centro = String(werks || "TLP1").trim();
     if (!eq || !cat) return [];
 
-    const filterRaw = `Intrm eq '${eq}' and Zeinr eq '${cat}'`;
-    console.log("[BomItemsSet] filter:", filterRaw);
+    const cacheKey = `${eq}_${cat}_${centro}`;
+    if (bomCacheRef.current[cacheKey]) {
+      return bomCacheRef.current[cacheKey];
+    }
 
+    const filterRaw = `Intrm eq '${eq}' and Zeinr eq '${cat}' and Werks eq '${centro}'`;
     const url =
       "/api/odata/ZCS_GET_BOM_MATERIAL_SRV/BomItemsSet" +
       `?$filter=${encodeURIComponent(filterRaw)}` +
       "&$format=json";
 
-    const res = await api.get(url, { headers: { Accept: "application/json" } });
-    const data = res?.data?.d?.results ?? res?.data?.value ?? [];
+    try {
+      const res = await api.get(url, { headers: { Accept: "application/json" } });
+      const data = res?.data?.d?.results ?? res?.data?.value ?? [];
 
-    const mappedRaw = data.map((x) => ({
-      Idnrk: String(x?.Idnrk ?? x?.IDNRK ?? "").trim(),
-      Ojtxp: String(x?.Ojtxp ?? x?.OJTXP ?? "").trim(),
-    }));
+      const mappedRaw = data.map((x) => ({
+        Idnrk: String(x?.Idnrk ?? x?.IDNRK ?? "").trim(),
+        Ojtxp: String(x?.Ojtxp ?? x?.OJTXP ?? "").trim(),
+      }));
 
-    const uniq = new Map();
-    for (const it of mappedRaw) {
-      if (!it.Idnrk) continue;
-      if (!uniq.has(it.Idnrk)) uniq.set(it.Idnrk, it);
+      const uniq = new Map();
+      for (const it of mappedRaw) {
+        if (!it.Idnrk) continue;
+        if (!uniq.has(it.Idnrk)) uniq.set(it.Idnrk, it);
+      }
+      
+      const resultadoFinal = Array.from(uniq.values());
+      bomCacheRef.current[cacheKey] = resultadoFinal;
+
+      return resultadoFinal;
+    } catch (err) {
+      throw err;
     }
-    return Array.from(uniq.values());
   };
 
   const ensureNotFoundCategories = async (opIndex, compIndex) => {
@@ -535,7 +500,6 @@ export default function CrearOrdenMantto() {
         return normalizeOpsAndComponents(next, planPlant);
       });
     } catch (e) {
-      console.error("Error CategoriaManttoSet:", e);
       Alert.alert(
         "Categorías",
         "No se pudieron cargar las categorías de mantenimiento.",
@@ -562,7 +526,7 @@ export default function CrearOrdenMantto() {
             NotFoundCategory: zeinr,
             LoadingNotFoundMaterials: true,
             NotFoundMaterials: [],
-            MultiSelected: [], // ✅ solo 1 permitido, arrancamos limpio
+            MultiSelected: [],
           };
         });
         return { ...op, Components: comps };
@@ -574,6 +538,7 @@ export default function CrearOrdenMantto() {
       const mats = await fetchNotFoundBomItems({
         equipmentIntrm: intrm,
         zeinr,
+        werks: planPlant,
       });
       setOperations((prev) => {
         const next = prev.map((op, i) => {
@@ -591,7 +556,6 @@ export default function CrearOrdenMantto() {
         return normalizeOpsAndComponents(next, planPlant);
       });
     } catch (e) {
-      console.error("Error BomItemsSet:", e);
       Alert.alert(
         "Materiales",
         "No se pudieron cargar los materiales por BOM.",
@@ -617,17 +581,53 @@ export default function CrearOrdenMantto() {
     setMultiVisible(true);
 
     if (forceNotFound) {
-      await ensureNotFoundCategories(opIndex, compIndex);
+      const cats = await ensureNotFoundCategoriesAndMatch(opIndex, compIndex);
       return;
-    }
-
-    const current = operations?.[opIndex]?.Components?.[compIndex];
-    if (current?.NotFound && !(current?.NotFoundCategories || []).length) {
-      await ensureNotFoundCategories(opIndex, compIndex);
     }
   };
 
-  // ==== Cargar materiales por categoría (COBERTURA) ====
+ // 🧠 Función auxiliar para buscar coincidencia automática con el reporte del mecánico
+  const ensureNotFoundCategoriesAndMatch = async (opIndex, compIndex) => {
+    updateComponent(opIndex, compIndex, "LoadingNotFoundCategories", true);
+
+    try {
+      const cats = await fetchNotFoundCategories();
+      
+      // Intentamos hacer match inteligente con la ubicación que trajo el aviso (ej. "Cuarto de Máquinas" -> "CUARTOMAQ")
+      const matchCat = cats.find(c => {
+        if (!ubicacionObjetoFalla) return false;
+        const catText = (c.Texto || c.Zeinr || "").toLowerCase();
+        const objFalla = ubicacionObjetoFalla.toLowerCase();
+        return objFalla.includes(catText) || catText.includes(objFalla.substring(0, 6));
+      });
+
+      setOperations((prev) => {
+        const next = prev.map((op, i) => {
+          if (i !== opIndex) return op;
+          const comps = (op.Components || []).map((c, j) => {
+            if (j !== compIndex) return c;
+            return {
+              ...c,
+              NotFoundCategories: cats,
+              LoadingNotFoundCategories: false,
+            };
+          });
+          return { ...op, Components: comps };
+        });
+        return normalizeOpsAndComponents(next, planPlant);
+      });
+
+      // Si encontró una categoría gemela exacta del reporte del mecánico, la cargamos de inmediato
+      if (matchCat) {
+        await loadNotFoundMaterialsByCategory(opIndex, compIndex, matchCat.Zeinr);
+      }
+
+    } catch (e) {
+      Alert.alert("Categorías", "No se pudieron cargar las categorías de mantenimiento.");
+      updateComponent(opIndex, compIndex, "LoadingNotFoundCategories", false);
+    }
+  };
+
   const handleCategoryChangeForComponent = async (
     opIndex,
     compIndex,
@@ -649,7 +649,7 @@ export default function CrearOrdenMantto() {
               Material: "",
               LoadingMaterials: false,
               MultiSelected: [],
-              MultiTrackingno: "02",
+              MultiTrackingno: "01",
             };
           });
           return { ...o, Components: comps };
@@ -659,7 +659,6 @@ export default function CrearOrdenMantto() {
       return;
     }
 
-    // set loading
     setOperations((prev) => {
       const next = prev.map((o, i) => {
         if (i !== opIndex) return o;
@@ -714,7 +713,6 @@ export default function CrearOrdenMantto() {
         return normalizeOpsAndComponents(next, planPlant);
       });
     } catch (err) {
-      console.error("Error al cargar MaterialesCoberturaSet:", err);
       Alert.alert("Catálogo de materiales", "No se pudo cargar el catálogo.");
       setOperations((prev) => {
         const next = prev.map((o, i) => {
@@ -730,21 +728,12 @@ export default function CrearOrdenMantto() {
     }
   };
 
-  /** ===================== VALIDACIONES Y GUARDADO ===================== */
-  const onGuardar = async () => {
-    if (!selectedWorkCenter) {
-      Alert.alert(
-        "Centro de trabajo",
-        "Debes seleccionar un técnico (MnWkCtr).",
-      );
-      return;
-    }
+  const construirPayloadOrden = () => {
     if (!String(headerShortText || "").trim()) {
       Alert.alert("Descripción corta", "Captura el ShortText.");
-      return;
+      return null;
     }
 
-    // ✅ operaciones válidas: activity + desc + dur numérica
     const opsValidas = operations
       .map((op) => ({
         ...op,
@@ -768,13 +757,10 @@ export default function CrearOrdenMantto() {
         "Operaciones",
         "Debes capturar al menos una operación válida (descripción + duración > 0).",
       );
-      return;
+      return null;
     }
 
-    const workCntrValue = String(selectedWorkCenter.Arbpl || "").trim();
     const planPlantValue = String(planPlant).trim();
-
-    // ✅ Components payload: ligado a cada operación por Activity
     const componentItems = [];
     opsValidas.forEach((op) => {
       const opActivity = String(op.Activity).padStart(4, "0");
@@ -793,32 +779,43 @@ export default function CrearOrdenMantto() {
         if (!hasSomething) return;
 
         if (c.NotFound) {
-          const tracking = String(c.MultiTrackingno || "02").trim();
-          const sel = (c.MultiSelected || [])[0]; // ✅ solo 1
-          if (!sel?.Material) return;
+          const tracking = String(c.MultiTrackingno || "01").trim();
+          const selBOM = (c.MultiSelected || [])[0];
+          if (!selBOM?.Material) return;
+
+          const descBOM = String(selBOM.Descripcion || selBOM.Ojtxp || "").trim();
 
           componentItems.push({
             ItemNumber: String(c.ItemNumber || "").padStart(4, "0"),
-            Material: String(sel.Material || "").trim(),
+            Material: String(selBOM.Material || "").trim(),
+            //Descripcion: String(selBOM.Descripcion || selBOM.Ojtxp || "").trim(), // 👈 Validamos ambas opciones de la BOM
             RequirementQuantity: qty,
             StgeLoc: stge,
             Plant: planPlantValue,
             Activity: opActivity,
             Trackingno: tracking,
+            ItemCat: "L"
           });
+          c.DescripcionVisual = descBOM;
+          
           return;
         }
 
-        // Normal (un material)
+        const matEncontrado = (c.Materials || []).find(m => m.Material === c.Material);
+        const descConsumible = matEncontrado ? (matEncontrado.Descripcion || matEncontrado.Ojtxp) : c.Material;
+
         componentItems.push({
           ItemNumber: String(c.ItemNumber || "").padStart(4, "0"),
           Material: String(c.Material || "").trim(),
+          //Descripcion: String(descConsumible || "").trim(), // 👈 Aseguramos que pinte el nombre del consumible
           RequirementQuantity: qty,
           StgeLoc: stge,
           Plant: planPlantValue,
           Activity: opActivity,
-          Trackingno: String(c.Trackingno || "03").trim(),
+          Trackingno: String(c.Trackingno || "01").trim(),
+          ItemCat: "L"
         });
+        c.DescripcionVisual = String(descConsumible || "").trim();
       });
     });
 
@@ -826,13 +823,13 @@ export default function CrearOrdenMantto() {
     const numPeople =
       Number.isFinite(Number(peopleCount)) && Number(peopleCount) > 0
         ? Number(peopleCount)
-        : 1; // default si no seleccionan
+        : 1;
 
-    const payload = {
+    return {
       WorkOrderHeader: {
         OrderType: String(orderType).trim(),
         Planplant: planPlantValue,
-        MnWkCtr: workCntrValue,
+        MnWkCtr: "TEC_ELEV",
         Equipment: String(equipment || "").trim(),
         ShortText: String(headerShortText || "").trim(),
         StartDate: String(startDateStr).trim(),
@@ -842,60 +839,101 @@ export default function CrearOrdenMantto() {
       WorkOrderOperationSet: opsValidas.map((op) => {
         const base = {
           Activity: String(op.Activity || "").padStart(4, "0"),
-          WorkCntr: workCntrValue,
+          WorkCntr: "TEC_ELEV",
           Plant: planPlantValue,
           Description: String(op.Description || "").trim(),
-
-          // ✅ horas por persona (como tu ejemplo)
           DurationNormal: String(op.DurationNormal || "").trim(),
-
-          // ✅ número de personas asignadas (como tu ejemplo)
           NumberOfCapacities: String(numPeople),
         };
-
         if (op.IsExternal) base.ControlKey = "X";
         return base;
       }),
       WorkOrderComponentSet: componentItems,
       Return: [],
     };
+  };
+
+const handleIrAVistaPrevia = () => {
+    if (!String(headerShortText || "").trim()) {
+      Alert.alert("Descripción corta", "Captura la descripción corta de la orden.");
+      return;
+    }
+
+    const opsValidas = operations.filter((op) => {
+      const dur = Number(op.DurationNormal);
+      return /^\d{4}$/.test(op.Activity) && !!op.Description && !!op.DurationNormal && dur > 0;
+    });
+
+    if (!opsValidas.length) {
+      Alert.alert(
+        "Operaciones",
+        "Debes capturar al menos una operación válida (descripción + duración > 0)."
+      );
+      return;
+    }
+
+    // 🧠 VALIDACIÓN DINÁMICA: Solo exigimos datos si el componente tiene un material elegido
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i];
+      const comps = op.Components || [];
+
+      for (let j = 0; j < comps.length; j++) {
+        const c = comps[j];
+        
+        const tieneMaterialBOM = c.NotFound && (c.MultiSelected || []).length > 0;
+        const tieneMaterialConsumible = !c.NotFound && !!c.Material;
+
+        // Si seleccionó material, entonces SÍ es obligatorio cantidad y almacén
+        if (tieneMaterialBOM || tieneMaterialConsumible) {
+          const qty = String(c.RequirementQuantity || "").trim();
+          const stge = String(c.StgeLoc || "").trim();
+          const nombreMat = tieneMaterialBOM 
+            ? c.MultiSelected[0].Descripcion 
+            : (c.Materials.find(m => m.Material === c.Material)?.Descripcion || c.Material);
+
+          if (!qty || Number(qty) <= 0 || !stge) {
+            Alert.alert(
+              "Datos incompletos en Materiales",
+              `La pieza "${nombreMat}" en la Operación ${i + 1} tiene el material seleccionado pero te falta capturar:\n` +
+              (!qty || Number(qty) <= 0 ? "• La cantidad requerida\n" : "") +
+              (!stge ? "• El almacén (ej. BHER)" : "")
+            );
+            return;
+          }
+        }
+      }
+    }
+
+    const payload = construirPayloadOrden();
+    if (!payload) return;
+    setPayloadPreview(payload);
+    setStep(3);
+  };
+
+  const onConfirmarGuardado = async () => {
+    if (!payloadPreview) return;
+
+    console.log("🚀 [SAP PAYLOAD ENVIADO]:", JSON.stringify(payloadPreview, null, 2));
 
     try {
       setSaving(true);
-
-      console.log("[CREATE WO] payload:", JSON.stringify(payload, null, 2));
-
       const url = "/api/odata/ZCS_CREATE_WORKORDER_SRV_02/WorkOrderSet";
-      console.log("[CREATE WO] NotifNo usado:", notifOriginal);
 
-      const res = await api.post(url, payload, {
+      const res = await api.post(url, payloadPreview, {
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
         },
       });
 
-      console.log(
-        "[CREATE WO] create response:",
-        JSON.stringify(res.data, null, 2),
-      );
-      console.log(
-        "[CREATE WO] response headers keys:",
-        Object.keys(res.headers || {}),
-      );
-
-      // ✅ 1) Intentar Return inline
       const parsed = extractOrderFromReturn(res?.data);
       let orderId = parsed?.orderId || null;
       let avisoCreado = parsed?.notifNo || null;
       let ofertaNo = parsed?.offerNo || null;
       let ofertaMsg = parsed?.offerMessage || null;
 
-      // ✅ 2) Fallback: sap-message
       if (!orderId) {
         const fromHeader = extractFromSapMessageHeader(res?.headers);
-        if (fromHeader?.text)
-          console.log("[CREATE WO] sap-message parsed:", fromHeader.text);
         orderId = fromHeader.orderId || orderId;
         avisoCreado = fromHeader.notifNo || avisoCreado;
       }
@@ -913,20 +951,15 @@ export default function CrearOrdenMantto() {
 
       const baseMsg = orderId
         ? `✅ Orden creada: ${orderId}
-        📌 Aviso original: ${avisoOriginal || "—"}
-        📩 Aviso SAP (retorno): ${avisoCreado || "—"}
-        💰 Oferta: ${ofertaNo ? ofertaNo : "—"}${ofertaMsg ? `\n🧾 ${ofertaMsg}` : ""}`
-        : "✅ Orden creada (no pude leer el número desde Return/sap-message).";
+📌 Aviso original: ${avisoOriginal || "—"}
+📩 Aviso SAP (retorno): ${avisoCreado || "—"}
+💰 Oferta: ${ofertaNo ? ofertaNo : "—"}${ofertaMsg ? `\n🧾 ${ofertaMsg}` : ""}`
+        : "✅ Orden creada exitosamente.";
 
       Alert.alert("Orden creada", baseMsg, [
         { text: "OK", onPress: () => router.replace("/supervisor/averia") },
       ]);
     } catch (err) {
-      console.error(
-        "Error al crear orden de mantenimiento:",
-        err?.response?.data || err,
-      );
-
       const sapMsg =
         err?.response?.data?.error?.message?.value ||
         err?.response?.data?.error?.message ||
@@ -940,739 +973,819 @@ export default function CrearOrdenMantto() {
     }
   };
 
-  /** ===================== RENDER ===================== */
   return (
     <View style={styles.container}>
       <Header title="Crear orden de mantenimiento" />
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
+      <ScrollView
+      ref={scrollViewRef} 
+      contentContainerStyle={styles.scrollContent}>
         <TouchableOpacity
           style={styles.backRow}
           onPress={goBack}
           activeOpacity={0.6}
         >
           <Ionicons name="chevron-back" size={20} color={COLORS.accent} />
-          <Text style={styles.backText}>Volver al aviso</Text>
+          <Text style={styles.backText}>
+            {step === 3 ? "Volver a operaciones" : step === 2 ? "Volver a datos generales" : "Volver al aviso"}
+          </Text>
         </TouchableOpacity>
 
-        <View style={styles.cardHighlight}>
-          <View style={styles.chipRow}>
-            <View style={styles.chip}>
-              <Ionicons
-                name="alert-circle-outline"
-                size={14}
-                color={COLORS.accent}
-                style={{ marginRight: 4 }}
-              />
-              <Text style={styles.chipText}>Aviso {notifNo || averiaid}</Text>
-            </View>
-
-            {equipment ? (
-              <View style={styles.chip}>
-                <Ionicons
-                  name="hardware-chip-outline"
-                  size={14}
-                  color={COLORS.accent}
-                  style={{ marginRight: 4 }}
-                />
-                <Text style={styles.chipText}>{equipment}</Text>
-              </View>
-            ) : null}
+        {/* 🗺️ BARRA DE PROGRESO POR ETAPAS */}
+        <View style={styles.wizardIndicatorRow}>
+          <View style={[styles.wizardStepBadge, step === 1 && styles.wizardStepActive]}>
+            <Text style={[styles.wizardStepText, step === 1 && styles.wizardTextActive]}>1. General</Text>
           </View>
-
-          {shortText ? (
-            <Text style={styles.mainTitle}>{shortText}</Text>
-          ) : (
-            <Text style={styles.mainTitleMuted}>
-              Sin descripción corta en el aviso
-            </Text>
-          )}
-
-          <View style={styles.block}>
-            <Text style={styles.infoLabel}>Ubicación funcional</Text>
-            <Text style={styles.infoValue}>{MaterialLong || "—"}</Text>
+          <View style={[styles.wizardStepBadge, step === 2 && styles.wizardStepActive]}>
+            <Text style={[styles.wizardStepText, step === 2 && styles.wizardTextActive]}>2. Operaciones</Text>
+          </View>
+          <View style={[styles.wizardStepBadge, step === 3 && styles.wizardStepActive]}>
+            <Text style={[styles.wizardStepText, step === 3 && styles.wizardTextActive]}>3. Resumen</Text>
           </View>
         </View>
 
-        {/* Datos de la orden */}
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Datos de la orden</Text>
+        {/* ======================================================== */}
+        {/* ETAPA 1: INFORMACIÓN GENERAL Y TÉCNICO */}
+        {/* ======================================================== */}
+        {step === 1 && (
+          <>
+            <View style={styles.cardHighlight}>
+              <View style={styles.chipRow}>
+                <View style={styles.chip}>
+                  <Ionicons name="alert-circle-outline" size={14} color={COLORS.accent} style={{ marginRight: 4 }} />
+                  <Text style={styles.chipText}>Aviso {notifNo || averiaid}</Text>
+                </View>
 
-          <View style={styles.chipRow}>
-            <View style={styles.chipSmall}>
-              <Text style={styles.chipTextSmall}>OrderType: {orderType}</Text>
-            </View>
-            <View style={styles.chipSmall}>
-              <Text style={styles.chipTextSmall}>Planplant: {planPlant}</Text>
-            </View>
-          </View>
-
-          <View style={{ marginTop: 12, marginBottom: 14 }}>
-            <Text style={styles.fieldLabel}>Descripción corta de la orden</Text>
-            <TextInput
-              style={[
-                styles.input,
-                { minHeight: 60, textAlignVertical: "top" },
-              ]}
-              value={headerShortText}
-              onChangeText={setHeaderShortText}
-              placeholder="Escribe aquí la descripción corta (Supervisor)..."
-              placeholderTextColor={COLORS.muted}
-              multiline
-            />
-          </View>
-
-          <Text style={styles.fieldLabel}>Técnico asignado</Text>
-          {loadingWorkCenters ? (
-            <View style={{ paddingVertical: 8 }}>
-              <ActivityIndicator color={COLORS.accent} />
-            </View>
-          ) : (
-            <SelectWorkCenter
-              items={workCenters}
-              selected={selectedWorkCenter}
-              onSelect={setSelectedWorkCenter}
-            />
-          )}
-
-          {/* ✅ Fechas con selector */}
-          <View style={styles.dateRow}>
-            <View style={styles.dateCol}>
-              <Text style={styles.fieldLabel}>Fecha inicio</Text>
-              <TouchableOpacity
-                style={[styles.input, styles.multiInput]}
-                onPress={() => openDateTimePicker("start")}
-                activeOpacity={0.75}
-              >
-                <Text
-                  style={{ fontSize: 13, color: COLORS.title }}
-                  numberOfLines={1}
-                >
-                  {startDateStr}
-                </Text>
-                <Ionicons
-                  name="calendar-outline"
-                  size={18}
-                  color={COLORS.muted}
-                />
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.dateCol}>
-              <Text style={styles.fieldLabel}>Fecha fin</Text>
-              <TouchableOpacity
-                style={[styles.input, styles.multiInput]}
-                onPress={() => openDateTimePicker("finish")}
-                activeOpacity={0.75}
-              >
-                <Text
-                  style={{ fontSize: 13, color: COLORS.title }}
-                  numberOfLines={1}
-                >
-                  {finishDateStr}
-                </Text>
-                <Ionicons
-                  name="calendar-outline"
-                  size={18}
-                  color={COLORS.muted}
-                />
-              </TouchableOpacity>
-            </View>
-          </View>
-
-          <Text style={styles.helpText}>
-            Se enviará en formato:{" "}
-            <Text style={{ fontWeight: "700" }}>YYYY-MM-DDTHH:mm:ss</Text>
-          </Text>
-        </View>
-
-        {/* ✅ Operaciones + Materiales ligados */}
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Operaciones + materiales</Text>
-          <Text style={styles.sectionSubtitle}>
-            Captura cada operación y dentro agrega los materiales de esa
-            operación.
-          </Text>
-
-          {operations.map((op, opIndex) => (
-            <View key={`${opIndex}-${op.Activity}`} style={styles.opCard}>
-              <View style={styles.opHeader}>
-                <Text style={styles.opTitle}>
-                  Operación {opIndex + 1} · Actividad {op.Activity}
-                </Text>
-                {operations.length > 1 && (
-                  <TouchableOpacity
-                    onPress={() => removeOperation(opIndex)}
-                    style={styles.opDeleteBtn}
-                  >
-                    <Ionicons
-                      name="trash-outline"
-                      size={16}
-                      color={COLORS.danger}
-                    />
-                  </TouchableOpacity>
-                )}
+                {equipment ? (
+                  <View style={styles.chip}>
+                    <Ionicons name="hardware-chip-outline" size={14} color={COLORS.accent} style={{ marginRight: 4 }} />
+                    <Text style={styles.chipText}>{equipment}</Text>
+                  </View>
+                ) : null}
               </View>
 
-              <Row label="Actividad" value={op.Activity} />
+              {shortText ? (
+                <Text style={styles.mainTitle}>{shortText}</Text>
+              ) : (
+                <Text style={styles.mainTitleMuted}>Sin descripción corta en el aviso</Text>
+              )}
 
-              <Text style={styles.fieldLabel}>Tipo de operación</Text>
-              <View style={styles.toggleRow}>
-                <TouchableOpacity
-                  style={[
-                    styles.toggleChip,
-                    !op.IsExternal && styles.toggleChipActive,
-                  ]}
-                  onPress={() => updateOperation(opIndex, "IsExternal", false)}
-                  activeOpacity={0.85}
-                >
-                  <Text
-                    style={[
-                      styles.toggleText,
-                      !op.IsExternal && styles.toggleTextActive,
-                    ]}
-                  >
-                    Interna
-                  </Text>
-                </TouchableOpacity>
+              <View style={styles.block}>
+                <Text style={styles.infoLabel}>Ubicación funcional</Text>
+                <Text style={styles.infoValue}>{MaterialLong || "—"}</Text>
+              </View>
+            </View>
 
-                <TouchableOpacity
-                  style={[
-                    styles.toggleChip,
-                    op.IsExternal && styles.toggleChipActive,
-                  ]}
-                  onPress={() => updateOperation(opIndex, "IsExternal", true)}
-                  activeOpacity={0.85}
-                >
-                  <Text
-                    style={[
-                      styles.toggleText,
-                      op.IsExternal && styles.toggleTextActive,
-                    ]}
-                  >
-                    Externa
-                  </Text>
-                </TouchableOpacity>
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>Datos de la orden</Text>
+
+              <View style={styles.chipRow}>
+                <View style={styles.chipSmall}>
+                  <Text style={styles.chipTextSmall}>OrderType: {orderType}</Text>
+                </View>
+                <View style={styles.chipSmall}>
+                  <Text style={styles.chipTextSmall}>Planplant: {planPlant}</Text>
+                </View>
               </View>
 
-              <View style={{ marginBottom: 10 }}>
-                <Text style={styles.fieldLabel}>
-                  Descripción de la actividad
-                </Text>
+              <View style={{ marginTop: 12, marginBottom: 14 }}>
+                <Text style={styles.fieldLabel}>Descripción corta de la orden</Text>
                 <TextInput
-                  style={[
-                    styles.input,
-                    { minHeight: 60, textAlignVertical: "top" },
-                  ]}
-                  value={op.Description}
-                  onChangeText={(txt) =>
-                    updateOperation(opIndex, "Description", txt)
-                  }
-                  placeholder="Describe la actividad de mantenimiento..."
+                  style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]}
+                  value={headerShortText}
+                  onChangeText={setHeaderShortText}
+                  placeholder="Escribe aquí la descripción corta (Supervisor)..."
                   placeholderTextColor={COLORS.muted}
                   multiline
                 />
               </View>
 
-              <Field
-                label="Duración (horas)"
-                value={op.DurationNormal}
-                onChangeText={(txt) =>
-                  updateOperation(
-                    opIndex,
-                    "DurationNormal",
-                    String(txt || "").replace(/[^0-9.]/g, ""),
-                  )
-                }
-                placeholder="Ej. 2"
-                keyboardType="numeric"
+              <View style={styles.dateRow}>
+                <View style={styles.dateCol}>
+                  <Text style={styles.fieldLabel}>Fecha inicio</Text>
+                  <TouchableOpacity
+                    style={[styles.input, styles.multiInput]}
+                    onPress={() => openDateTimePicker("start")}
+                    activeOpacity={0.75}
+                  >
+                    <Text style={{ fontSize: 13, color: COLORS.title }} numberOfLines={1}>
+                      {startDateStr}
+                    </Text>
+                    <Ionicons name="calendar-outline" size={18} color={COLORS.muted} />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.dateCol}>
+                  <Text style={styles.fieldLabel}>Fecha fin</Text>
+                  <TouchableOpacity
+                    style={[styles.input, styles.multiInput]}
+                    onPress={() => openDateTimePicker("finish")}
+                    activeOpacity={0.75}
+                  >
+                    <Text style={{ fontSize: 13, color: COLORS.title }} numberOfLines={1}>
+                      {finishDateStr}
+                    </Text>
+                    <Ionicons name="calendar-outline" size={18} color={COLORS.muted} />
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>Asignación</Text>
+              <SelectNumber
+                label="Seleccione el número de personas que se asignarán"
+                value={peopleCount}
+                min={1}
+                max={20}
+                onSelect={setPeopleCount}
               />
+            </View>
 
-              {/* ===== Materiales de esta operación ===== */}
-              <Text
-                style={[styles.sectionTitle, { marginTop: 6, fontSize: 13 }]}
-              >
-                Materiales de la operación {op.Activity}
+            <Pressable
+              style={styles.btnPrimary}
+              onPress={() => {
+                if (!headerShortText.trim()) {
+                  return Alert.alert("Faltan datos", "Captura la descripción corta de la orden.");
+                }
+                setStep(2);
+              }}
+            >
+              <View style={styles.btnPrimaryContent}>
+                <Text style={styles.btnPrimaryText}>Siguiente: Operaciones y Materiales</Text>
+                <Ionicons name="chevron-forward" size={18} color="#fff" style={{ marginLeft: 6 }} />
+              </View>
+            </Pressable>
+          </>
+        )}
+
+        {/* ======================================================== */}
+        {/* ETAPA 2: OPERACIONES Y TAREAS GUIADAS CON MEMORIA INTELIGENTE */}
+        {/* ======================================================== */}
+        {step === 2 && (
+          <>
+            <View style={styles.cardAsistencia}>
+              <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 4 }}>
+                <Ionicons name="sparkles" size={18} color={COLORS.accent} style={{ marginRight: 6 }} />
+                <Text style={styles.asistenciaTitle}>Asistente Inteligente de Mantenimiento</Text>
+              </View>
+              <Text style={styles.asistenciaText}>
+                La app te guiará paso a paso: primero define la tarea, luego cubre las refacciones reportadas y finalmente añade consumibles opcionales.
               </Text>
-              <Text style={[styles.sectionSubtitle, { marginBottom: 8 }]}>
-                Cada material se enviará con Activity = {op.Activity}.
+            </View>
+
+            {(() => {
+              const opActual = operations[0] || {};
+              const pendientes = obtenerPiezasPendientesDeSugerir(opActual.Components || [], piezasAviso);
+
+              if (piezasAviso.length > 0) {
+                return (
+                  <View style={[styles.sugerenciaCard, pendientes.length === 0 && { backgroundColor: "#F0FDF4", borderColor: "#BBF7D0" }]}>
+                    <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 6 }}>
+                      <Ionicons 
+                        name={pendientes.length > 0 ? "alert-circle" : "checkmark-circle"} 
+                        size={16} 
+                        color={pendientes.length > 0 ? "#D97706" : "#166534"} 
+                        style={{ marginRight: 6 }} 
+                      />
+                      <Text style={[styles.sugerenciaTitle, pendientes.length === 0 && { color: "#166534" }]}>
+                        {pendientes.length > 0 
+                          ? `⚠️ Faltan ${pendientes.length} refacción(es) por agregar de las reportadas:` 
+                          : "✅ ¡Todas las piezas reportadas ya fueron agregadas a la orden!"}
+                      </Text>
+                    </View>
+                    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }}>
+                      {piezasAviso.map((p, idx) => {
+                        const estaPendiente = pendientes.includes(p);
+                        return (
+                          <View 
+                            key={idx} 
+                            style={[
+                              styles.badgePiezaReportada, 
+                              !estaPendiente && { backgroundColor: "#DCFCE7", borderColor: "#BBF7D0" }
+                            ]}
+                          >
+                            <Text style={[styles.badgePiezaText, !estaPendiente && { color: "#166534" }]}>
+                              {estaPendiente ? "⏳ Pendiente: " : "✔ Agregada: "} {p}
+                            </Text>
+                          </View>
+                        );
+                      })}
+                    </View>
+                  </View>
+                );
+              }
+              return null;
+            })()}
+
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>Definición de Tareas y Materiales</Text>
+              <Text style={styles.sectionSubtitle}>
+                Paso 2 de 3: Estructura la operación paso a paso.
               </Text>
 
-              {(op.Components || []).map((c, compIndex) => {
-                const notFoundSelected = (c.MultiSelected || [])[0] || null;
+             {operations.map((op, opIndex) => {
+                const faltaDesc = !op.Description.trim();
+                const faltaDuracion = !op.DurationNormal;
+                
+                // 🧠 Validaciones de avance progresivo por pasos en cascada
+                const paso1Completo = !faltaDesc; // Ya escribió la descripción
+                const paso2Completo = paso1Completo; // Ya seleccionó si es interno o externo (por defecto toma un estado)
+                const paso3Completo = paso2Completo && !faltaDuracion; // Ya indicó las horas de duración
+
+                const piezasPendientesOp = obtenerPiezasPendientesDeSugerir(op.Components || [], piezasAviso);
+                const refaccionesBOMAgregadas = (op.Components || []).filter(c => c.NotFound);
+                const todasLasPiezasCubiertas = piezasAviso.length === 0 || piezasPendientesOp.length === 0;
+
+                const estaExpandida = opIndex === expandedOpIndex;
+                const tareaLista = !faltaDuracion && !faltaDesc;
 
                 return (
-                  <View
-                    key={`${opIndex}-${compIndex}-${c.ItemNumber}`}
-                    style={[
-                      styles.materialCard,
-                      compIndex > 0 && styles.materialCardSpaced,
-                    ]}
-                  >
-                    <View style={styles.opHeader}>
-                      <Text style={styles.opTitle}>
-                        Material {compIndex + 1} · Item {c.ItemNumber}
-                      </Text>
-                      {op.Components.length > 1 && (
+                  <View key={`${opIndex}-${op.Activity}`} style={styles.opCard}>
+                    
+                    {/* 🔄 ENCABEZADO TIPO ACORDEÓN INTELIGENTE */}
+                    <TouchableOpacity 
+                      style={styles.opHeaderMain}
+                      onPress={() => setExpandedOpIndex(estaExpandida ? -1 : opIndex)}
+                      activeOpacity={0.8}
+                    >
+                      <View style={styles.opBadgeActivity}>
+                        <Text style={styles.opBadgeText}>Actividad {op.Activity}</Text>
+                      </View>
+                      
+                      <View style={{ flex: 1, marginLeft: 6 }}>
+                        <Text style={styles.opTitleHeader}>
+                          Operación {opIndex + 1} {op.Description ? `— "${op.Description.substring(0, 22)}..."` : ""}
+                        </Text>
+                        {!estaExpandida && (
+                          <Text style={{ fontSize: 10, color: tareaLista && todasLasPiezasCubiertas ? "#166534" : "#D97706", fontWeight: "700" }}>
+                            {tareaLista && todasLasPiezasCubiertas ? "✔ Tarea configurada correctamente" : "⚠️ Configuración pendiente de completar"}
+                          </Text>
+                        )}
+                      </View>
+
+                      {operations.length > 1 && (
                         <TouchableOpacity
-                          onPress={() =>
-                            removeComponentFromOp(opIndex, compIndex)
-                          }
+                          onPress={(e) => {
+                            e.stopPropagation?.();
+                            removeOperation(opIndex);
+                          }}
                           style={styles.opDeleteBtn}
+                          hitSlop={8}
                         >
-                          <Ionicons
-                            name="trash-outline"
-                            size={16}
-                            color={COLORS.danger}
-                          />
+                          <Ionicons name="trash-outline" size={16} color={COLORS.danger} />
                         </TouchableOpacity>
                       )}
-                    </View>
 
-                    {/* ✅ (CAMBIO) Toggle “Material no encontrado” SIEMPRE visible */}
-                    <TouchableOpacity
-                      style={styles.notFoundRow}
-                      onPress={async () => {
-                        const next = !c.NotFound;
-
-                        setOperations((prev) => {
-                          const nextOps = prev.map((o, oi) => {
-                            if (oi !== opIndex) return o;
-                            const comps = (o.Components || []).map((cc, ci) => {
-                              if (ci !== compIndex) return cc;
-
-                              if (next) {
-                                // Cambia a BOM: limpia catálogo + limpia BOM + abre selector
-                                return {
-                                  ...cc,
-                                  NotFound: true,
-                                  // limpia catálogo
-                                  Material: "",
-                                  Category: "",
-                                  Materials: [],
-                                  LoadingMaterials: false,
-                                  // limpia BOM
-                                  NotFoundCategory: "",
-                                  NotFoundMaterials: [],
-                                  MultiSelected: [],
-                                  MultiTrackingno: "02",
-                                };
-                              }
-
-                              // Regresa a catálogo: limpia BOM (y deja catálogo listo para elegir de nuevo)
-                              return {
-                                ...cc,
-                                NotFound: false,
-                                // limpia BOM
-                                NotFoundCategory: "",
-                                NotFoundMaterials: [],
-                                MultiSelected: [],
-                                MultiTrackingno: "02",
-                              };
-                            });
-                            return { ...o, Components: comps };
-                          });
-                          return normalizeOpsAndComponents(nextOps, planPlant);
-                        });
-
-                        if (next) {
-                          await openMultiSelect(opIndex, compIndex, true);
-                        }
-                      }}
-                      activeOpacity={0.85}
-                    >
-                      <View
-                        style={[
-                          styles.checkbox,
-                          c.NotFound && styles.checkboxChecked,
-                        ]}
-                      >
-                        {c.NotFound && (
-                          <Ionicons name="checkmark" size={14} color="#fff" />
-                        )}
-                      </View>
-
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.notFoundTitle}>
-                          {c.NotFound
-                            ? "Material BOM activo"
-                            : "¿No encuentras el material?"}
-                        </Text>
-                        <Text style={styles.notFoundSubtitle}>
-                          {c.NotFound
-                            ? "Toca aquí para volver a catálogo"
-                            : "Buscar material desde BOM por categoría"}
-                        </Text>
-                      </View>
+                      <Ionicons 
+                        name={estaExpandida ? "chevron-up" : "chevron-down"} 
+                        size={18} 
+                        color={COLORS.muted} 
+                        style={{ marginLeft: 6 }} 
+                      />
                     </TouchableOpacity>
 
-                    {/* ✅ Si NO es NotFound: muestra categorías + material normal */}
-                    {!c.NotFound && (
+                    {/* 📂 CONTENIDO DE ASISTENTE PASO A PASO EN CASCADA */}
+                    {estaExpandida && (
                       <>
-                        <Text style={styles.fieldLabel}>
-                          Categoría de material
-                        </Text>
-                        <View style={styles.categoryRow}>
-                          <ScrollView
-                            horizontal
-                            showsHorizontalScrollIndicator={false}
-                          >
-                            <View style={styles.categoryChipsWrapper}>
-                              {MATERIAL_CATEGORIES.map((cat) => {
-                                const active = c.Category === cat;
-                                return (
-                                  <TouchableOpacity
-                                    key={cat}
-                                    style={[
-                                      styles.categoryChip,
-                                      active && styles.categoryChipActive,
-                                    ]}
-                                    onPress={() =>
-                                      handleCategoryChangeForComponent(
-                                        opIndex,
-                                        compIndex,
-                                        cat,
-                                      )
-                                    }
-                                    activeOpacity={0.8}
-                                  >
-                                    <Text
-                                      style={[
-                                        styles.categoryChipText,
-                                        active && styles.categoryChipTextActive,
-                                      ]}
+                        {/* ======================================================== */}
+                        {/* PASO 1: DESCRIPCIÓN DEL TRABAJO */}
+                        {/* ======================================================== */}
+                        <View style={styles.pasoPreguntaContainer}>
+                          <View style={styles.pasoHeaderRow}>
+                            <View style={styles.numeroPasoBadge}><Text style={styles.numeroPasoText}>1</Text></View>
+                            <Text style={styles.fieldLabelQuestion}>¿Qué trabajo específico se va a realizar?*</Text>
+                          </View>
+
+                          <TextInput
+                            style={[
+                              styles.input,
+                              { minHeight: 60, textAlignVertical: "top" },
+                              faltaDesc && { borderColor: "#93C5FD", backgroundColor: "#F8FAFC" }
+                            ]}
+                            value={op.Description}
+                            onChangeText={(txt) => updateOperation(opIndex, "Description", txt)}
+                            placeholder="Ej. Desmontaje de válvula de control..."
+                            placeholderTextColor={COLORS.muted}
+                            multiline
+                          />
+                          {faltaDesc && <Text style={styles.inputHelperText}>👉 Escribe la descripción para desbloquear los siguientes pasos.</Text>}
+                        </View>
+
+                        {/* ======================================================== */}
+                        {/* PASO 2: TIPO DE EJECUCIÓN (Se activa al llenar Paso 1) */}
+                        {/* ======================================================== */}
+                        {paso1Completo && (
+                          <View style={styles.pasoPreguntaContainer}>
+                            <View style={styles.pasoHeaderRow}>
+                              <View style={styles.numeroPasoBadge}><Text style={styles.numeroPasoText}>2</Text></View>
+                              <Text style={styles.fieldLabelQuestion}>¿Cómo se ejecutará esta tarea?</Text>
+                            </View>
+
+                            <View style={styles.toggleRow}>
+                              <TouchableOpacity
+                                style={[styles.toggleChipSmall, !op.IsExternal && styles.toggleChipActive]}
+                                onPress={() => updateOperation(opIndex, "IsExternal", false)}
+                              >
+                                <Text style={[styles.toggleTextSmall, !op.IsExternal && styles.toggleTextActive]}>🔧 Personal Interno</Text>
+                              </TouchableOpacity>
+                              <TouchableOpacity
+                                style={[styles.toggleChipSmall, op.IsExternal && styles.toggleChipActive]}
+                                onPress={() => updateOperation(opIndex, "IsExternal", true)}
+                              >
+                                <Text style={[styles.toggleTextSmall, op.IsExternal && styles.toggleTextActive]}>🏢 Proveedor / Externo</Text>
+                              </TouchableOpacity>
+                            </View>
+                          </View>
+                        )}
+
+                        {/* ======================================================== */}
+                        {/* PASO 3: DURACIÓN EN HORAS (Se activa al completar Paso 2) */}
+                        {/* ======================================================== */}
+                        {paso2Completo && (
+                          <View style={styles.pasoPreguntaContainer}>
+                            <View style={styles.pasoHeaderRow}>
+                              <View style={styles.numeroPasoBadge}><Text style={styles.numeroPasoText}>3</Text></View>
+                              <Text style={styles.fieldLabelQuestion}>¿Cuánto tiempo (duración en horas) tomará esta tarea?*</Text>
+                            </View>
+
+                            <View style={{ width: 140 }}>
+                              <Field
+                            label=""
+                            value={op.DurationNormal}
+                            onChangeText={(txt) => {
+                              const valorLimpio = String(txt || "").replace(/[^0-9.]/g, "");
+                              updateOperation(opIndex, "DurationNormal", valorLimpio);
+                              
+                              // 🚀 Si acaba de poner un valor válido, hacemos scroll automático hacia abajo
+                              if (valorLimpio.length > 0) {
+                                scrollToBottom();
+                              }
+                            }}
+                            placeholder="Ej. 3"
+                            keyboardType="numeric"
+                          />
+                            </View>
+                            {faltaDuracion && <Text style={styles.inputHelperText}>👉 Indica las horas para habilitar las refacciones de la BOM.</Text>}
+                          </View>
+                        )}
+
+                        {/* ======================================================== */}
+                        {/* PASO 4: REFACCIONES DE LA BOM (LIBRE Y MÚLTIPLE) */}
+                        {/* ======================================================== */}
+                        {paso3Completo && (
+                          <View style={styles.pasoPreguntaContainer}>
+                            <View style={styles.pasoHeaderRow}>
+                              <View style={[styles.numeroPasoBadge, { backgroundColor: "#166534" }]}><Text style={styles.numeroPasoText}>4</Text></View>
+                              <Text style={styles.fieldLabelQuestion}>Refacciones de la BOM del equipo</Text>
+                            </View>
+                            <Text style={styles.subSectionHint}>
+                              {piezasAviso.length > 0 
+                                ? `El técnico reportó: ${piezasAviso.join(", ")}. Puedes agregar estas u otras refacciones adicionales detectadas.`
+                                : "Selecciona las partes específicas del equipo requeridas."}
+                            </Text>
+
+                            {/* 💡 Atajo inteligente si hay piezas reportadas pendientes */}
+                            {refaccionesBOMAgregadas.length === 0 && piezasAviso.length > 0 && (
+                              <TouchableOpacity 
+                                style={styles.btnAsistenteDestacado} 
+                                onPress={async () => {
+                                  setOperations((prev) => {
+                                    const next = prev.map((o, i) => {
+                                      if (i !== opIndex) return o;
+                                      const newComp = emptyComponent(normItemNumberByIndex((o.Components || []).length), planPlant, o.Activity);
+                                      newComp.NotFound = true;
+                                      return { ...o, Components: [...(o.Components || []), newComp] };
+                                    });
+                                    return normalizeOpsAndComponents(next, planPlant);
+                                  });
+                                  await openMultiSelect(opIndex, operations[opIndex].Components.length, true);
+                                }}
+                              >
+                                <Ionicons name="sparkles" size={16} color="#166534" style={{ marginRight: 6 }} />
+                                <Text style={styles.btnAsistenteText}>Asociar pieza reportada por el técnico ("{piezasAviso[0]}")</Text>
+                              </TouchableOpacity>
+                            )}
+
+                            {/* Listado de refacciones BOM que ya se fueron agregando */}
+                            {refaccionesBOMAgregadas.map((c) => {
+                              const compIndex = op.Components.findIndex(item => item === c);
+                              const notFoundSelected = (c.MultiSelected || [])[0] || null;
+                              const materialSeleccionado = !!(c.MultiSelected || [])[0]?.Material; 
+                              const incompletoBOM = materialSeleccionado && (!c.RequirementQuantity || !c.StgeLoc);
+
+                              return (
+                                <View 
+                                  key={`bom-${compIndex}`} 
+                                  style={[
+                                    styles.materialCard, 
+                                    { backgroundColor: "#FAFBFF", marginBottom: 8 },
+                                    incompletoBOM && { borderColor: "#F87171", borderWidth: 1.5 }
+                                  ]}
+                                >
+                                  <View style={styles.materialCardHeader}>
+                                    <Text style={styles.materialCardTitle}>Refacción BOM · Item {c.ItemNumber}</Text>
+                                    <TouchableOpacity
+                                      onPress={() => removeComponentFromOp(opIndex, compIndex)}
+                                      style={styles.opDeleteBtn}
                                     >
-                                      {cat}
+                                      <Ionicons name="trash-outline" size={14} color={COLORS.danger} />
+                                    </TouchableOpacity>
+                                  </View>
+
+                                  <TouchableOpacity
+                                    style={styles.btnBomSelect}
+                                    onPress={() => openMultiSelect(opIndex, compIndex, true)}
+                                    activeOpacity={0.85}
+                                  >
+                                    <Ionicons name="search-outline" size={16} color={COLORS.accent} />
+                                    <Text style={styles.btnBomSelectText}>
+                                      {notFoundSelected ? "Cambiar refacción BOM" : "🔍 Buscar refacción en BOM"}
                                     </Text>
                                   </TouchableOpacity>
-                                );
-                              })}
+
+                                  {!!notFoundSelected && (
+                                    <View style={styles.selectedBimBox}>
+                                      <Text style={{ fontSize: 11, color: COLORS.muted, marginBottom: 2 }}>Seleccionado:</Text>
+                                      <Text style={{ fontSize: 13, color: COLORS.title, fontWeight: "800" }}>
+                                        {notFoundSelected.Descripcion || "—"}
+                                      </Text>
+                                      <Text style={{ fontSize: 11, color: COLORS.text }}>
+                                        Código: {notFoundSelected.Material || "—"}
+                                      </Text>
+                                    </View>
+                                  )}
+
+                                  <View style={{ flexDirection: "row", gap: 10, marginTop: 4 }}>
+                                    <View style={{ flex: 1 }}>
+                                      <Field
+                                        label="Cantidad"
+                                        value={c.RequirementQuantity}
+                                        onChangeText={(txt) =>
+                                          updateComponent(
+                                            opIndex,
+                                            compIndex,
+                                            "RequirementQuantity",
+                                            String(txt || "").replace(/[^0-9.]/g, ""),
+                                          )
+                                        }
+                                        placeholder="Ej. 1"
+                                        keyboardType="numeric"
+                                      />
+                                    </View>
+                                    <View style={{ width: 100 }}>
+                                      <Field
+                                        label="Almacén"
+                                        value={c.StgeLoc}
+                                        onChangeText={(txt) => updateComponent(opIndex, compIndex, "StgeLoc", txt)}
+                                        placeholder="BHER"
+                                      />
+                                    </View>
+                                  </View>
+
+                                  {incompletoBOM && (
+                                    <Text style={{ fontSize: 10, color: "#DC2626", marginTop: 4, fontWeight: "700" }}>
+                                      ⚠️ Falta capturar cantidad y/o almacén para esta pieza.
+                                    </Text>
+                                  )}
+                                </View>
+                              );
+                            })}
+
+                            {/* 🚀 BOTÓN LIBRE: Permite agregar cualquier otra refacción de la BOM sin restricciones */}
+                            <TouchableOpacity 
+                              style={styles.btnAddConsumibleBtn} 
+                              onPress={async () => {
+                                setOperations((prev) => {
+                                  const next = prev.map((o, i) => {
+                                    if (i !== opIndex) return o;
+                                    const newComp = emptyComponent(normItemNumberByIndex((o.Components || []).length), planPlant, o.Activity);
+                                    newComp.NotFound = true; // Sigue siendo de la BOM
+                                    return { ...o, Components: [...(o.Components || []), newComp] };
+                                  });
+                                  return normalizeOpsAndComponents(next, planPlant);
+                                });
+                                await openMultiSelect(opIndex, operations[opIndex].Components.length, true);
+                              }}
+                            >
+                              <Ionicons name="add-circle-outline" size={16} color="#166534" />
+                              <Text style={[styles.btnAddMaterialText, { color: "#166534" }]}>
+                                + Agregar otra refacción adicional de la BOM
+                              </Text>
+                            </TouchableOpacity>
+                          </View>
+                        )}
+
+                        {/* ======================================================== */}
+                        {/* PASO 5: CONSUMIBLES DE ALMACÉN (DINÁMICO Y OCULTO HASTA DECIDIR) */}
+                        {/* ======================================================== */}
+                        {paso3Completo && (
+                          <View style={styles.pasoPreguntaContainer}>
+                            <View style={styles.pasoHeaderRow}>
+                              <View style={[styles.numeroPasoBadge, { backgroundColor: "#64748B" }]}><Text style={styles.numeroPasoText}>5</Text></View>
+                              <Text style={styles.fieldLabelQuestion}>¿Requiere consumibles de almacén para esta tarea?</Text>
                             </View>
-                          </ScrollView>
-                        </View>
 
-                        {c.LoadingMaterials && (
-                          <View style={{ paddingVertical: 4 }}>
-                            <ActivityIndicator color={COLORS.accent} />
+                            {(() => {
+                              // Filtramos únicamente los consumibles (los que NO son NotFound/BOM)
+                              const consumiblesOp = (op.Components || []).filter(c => !c.NotFound);
+
+                              // SI NO HAY CONSUMIBLES ACTIVOS: Mostramos únicamente el botón de decisión
+                              if (consumiblesOp.length === 0) {
+                                return (
+                                  <TouchableOpacity 
+                                    style={styles.btnAddConsumibleBtn} 
+                                    onPress={() => {
+                                      setOperations((prev) => {
+                                        const next = prev.map((o, i) => {
+                                          if (i !== opIndex) return o;
+                                          const newComp = emptyComponent(normItemNumberByIndex((o.Components || []).length), planPlant, o.Activity);
+                                          newComp.NotFound = false; // Marcado como consumible
+                                          return { ...o, Components: [...(o.Components || []), newComp] };
+                                        });
+                                        return normalizeOpsAndComponents(next, planPlant);
+                                      });
+                                    }}
+                                  >
+                                    <Ionicons name="add-circle-outline" size={16} color={COLORS.accent} />
+                                    <Text style={styles.btnAddMaterialText}>+ Sí, requiero un consumible de almacén</Text>
+                                  </TouchableOpacity>
+                                );
+                              }
+
+                              // SI YA DECIDIÓ AGREGAR: Mostramos las tarjetas de consumibles y el botón para agregar más
+                              return (
+                                <>
+                                  {consumiblesOp.map((c) => {
+                                    const compIndex = op.Components.findIndex(item => item === c);
+                                    const materialConsumibleSeleccionado = !!c.Material; 
+                                    const incompletoConsumible = materialConsumibleSeleccionado && (!c.RequirementQuantity || !c.StgeLoc);
+                                    return (
+                                      <View 
+                                        key={`cons-${compIndex}`} 
+                                        style={[
+                                          styles.materialCard, 
+                                          { marginBottom: 8, marginTop: 6 },
+                                          incompletoConsumible && { borderColor: "#F87171", borderWidth: 1.5 }
+                                        ]}
+                                      >
+                                        <View style={styles.materialCardHeader}>
+                                          <Text style={styles.materialCardTitle}>Consumible · Item {c.ItemNumber}</Text>
+                                          <TouchableOpacity
+                                            onPress={() => removeComponentFromOp(opIndex, compIndex)}
+                                            style={styles.opDeleteBtn}
+                                          >
+                                            <Ionicons name="trash-outline" size={14} color={COLORS.danger} />
+                                          </TouchableOpacity>
+                                        </View>
+
+                                        <Text style={styles.fieldLabel}>Categoría</Text>
+                                        <View style={styles.categoryRow}>
+                                          <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                                            <View style={styles.categoryChipsWrapper}>
+                                              {MATERIAL_CATEGORIES.map((cat) => {
+                                                const active = c.Category === cat;
+                                                return (
+                                                  <TouchableOpacity
+                                                    key={cat}
+                                                    style={[styles.categoryChip, active && styles.categoryChipActive]}
+                                                    onPress={() => handleCategoryChangeForComponent(opIndex, compIndex, cat)}
+                                                    activeOpacity={0.8}
+                                                  >
+                                                    <Text style={[styles.categoryChipText, active && styles.categoryChipTextActive]}>
+                                                      {cat}
+                                                    </Text>
+                                                  </TouchableOpacity>
+                                                );
+                                              })}
+                                            </View>
+                                          </ScrollView>
+                                        </View>
+
+                                        {c.LoadingMaterials && (
+                                          <View style={{ paddingVertical: 4 }}>
+                                            <ActivityIndicator color={COLORS.accent} />
+                                          </View>
+                                        )}
+
+                                        <View style={{ marginBottom: 10, marginTop: 6 }}>
+                                          <Text style={styles.fieldLabel}>Material</Text>
+                                          <SelectMaterial
+                                            items={c.Materials || []}
+                                            value={c.Material}
+                                            onSelect={(materialCode) =>
+                                              updateComponent(opIndex, compIndex, "Material", materialCode)
+                                            }
+                                            disabled={!c.Category || c.LoadingMaterials}
+                                          />
+                                        </View>
+
+                                        <View style={{ flexDirection: "row", gap: 10 }}>
+                                          <View style={{ flex: 1 }}>
+                                            <Field
+                                              label="Cantidad"
+                                              value={c.RequirementQuantity}
+                                              onChangeText={(txt) =>
+                                                updateComponent(
+                                                  opIndex,
+                                                  compIndex,
+                                                  "RequirementQuantity",
+                                                  String(txt || "").replace(/[^0-9.]/g, ""),
+                                                )
+                                              }
+                                              placeholder="Ej. 2"
+                                              keyboardType="numeric"
+                                            />
+                                          </View>
+                                          <View style={{ width: 100 }}>
+                                            <Field
+                                              label="Almacén"
+                                              value={c.StgeLoc}
+                                              onChangeText={(txt) => updateComponent(opIndex, compIndex, "StgeLoc", txt)}
+                                              placeholder="BHER"
+                                            />
+                                          </View>
+                                        </View>
+
+                                        {incompletoConsumible && (
+                                          <Text style={{ fontSize: 10, color: "#DC2626", marginTop: 4, fontWeight: "700" }}>
+                                            ⚠️ Selecciona material, cantidad y almacén.
+                                          </Text>
+                                        )}
+                                      </View>
+                                    );
+                                  })}
+
+                                  <TouchableOpacity 
+                                    style={styles.btnAddConsumibleBtn} 
+                                    onPress={() => {
+                                      setOperations((prev) => {
+                                        const next = prev.map((o, i) => {
+                                          if (i !== opIndex) return o;
+                                          const newComp = emptyComponent(normItemNumberByIndex((o.Components || []).length), planPlant, o.Activity);
+                                          newComp.NotFound = false;
+                                          return { ...o, Components: [...(o.Components || []), newComp] };
+                                        });
+                                        return normalizeOpsAndComponents(next, planPlant);
+                                      });
+                                    }}
+                                  >
+                                    <Ionicons name="add-circle-outline" size={16} color={COLORS.accent} />
+                                    <Text style={styles.btnAddMaterialText}>+ ¿Requiere otro consumible adicional?</Text>
+                                  </TouchableOpacity>
+                                </>
+                              );
+                            })()}
                           </View>
                         )}
 
-                        <View style={{ marginBottom: 10 }}>
-                          <Text style={styles.fieldLabel}>Material</Text>
-                          <SelectMaterial
-                            items={c.Materials || []}
-                            value={c.Material}
-                            onSelect={(materialCode) =>
-                              updateComponent(
-                                opIndex,
-                                compIndex,
-                                "Material",
-                                materialCode,
-                              )
-                            }
-                            disabled={!c.Category || c.LoadingMaterials}
-                          />
-                        </View>
-
-                        <Text style={styles.fieldLabel}>Tipo de material</Text>
-                        <View style={styles.toggleRow}>
-                          <TouchableOpacity
-                            style={[
-                              styles.toggleChip,
-                              c.Trackingno === "03" && styles.toggleChipActive,
-                            ]}
-                            onPress={() =>
-                              updateComponent(
-                                opIndex,
-                                compIndex,
-                                "Trackingno",
-                                "03",
-                              )
-                            }
-                            activeOpacity={0.85}
-                          >
-                            <Text
-                              style={[
-                                styles.toggleText,
-                                c.Trackingno === "03" &&
-                                  styles.toggleTextActive,
-                              ]}
-                            >
-                              Directo
-                            </Text>
-                          </TouchableOpacity>
-
-                          <TouchableOpacity
-                            style={[
-                              styles.toggleChip,
-                              c.Trackingno === "02" && styles.toggleChipActive,
-                            ]}
-                            onPress={() =>
-                              updateComponent(
-                                opIndex,
-                                compIndex,
-                                "Trackingno",
-                                "02",
-                              )
-                            }
-                            activeOpacity={0.85}
-                          >
-                            <Text
-                              style={[
-                                styles.toggleText,
-                                c.Trackingno === "02" &&
-                                  styles.toggleTextActive,
-                              ]}
-                            >
-                              Préstamo / Falla
-                            </Text>
-                          </TouchableOpacity>
-                        </View>
                       </>
                     )}
 
-                    {/* ✅ Si ES NotFound: selección BOM (solo 1) + mostrar seleccionado */}
-                    {c.NotFound && (
-                      <>
-                        <TouchableOpacity
-                          style={[
-                            styles.btnMini,
-                            { opacity: c.LoadingNotFoundCategories ? 0.7 : 1 },
-                          ]}
-                          onPress={() =>
-                            openMultiSelect(opIndex, compIndex, false)
-                          }
-                          activeOpacity={0.85}
-                        >
-                          <Ionicons
-                            name="list-outline"
-                            size={16}
-                            color={COLORS.accent}
-                          />
-                          <Text style={styles.btnMiniText}>
-                            {notFoundSelected
-                              ? "Cambiar material BOM"
-                              : "Seleccionar material BOM"}
-                          </Text>
-                        </TouchableOpacity>
-
-                        {!!notFoundSelected && (
-                          <View
-                            style={{
-                              marginTop: 8,
-                              padding: 10,
-                              borderWidth: 1,
-                              borderColor: COLORS.border,
-                              borderRadius: 12,
-                              backgroundColor: "#FAFBFF",
-                            }}
-                          >
-                            <Text
-                              style={{
-                                fontSize: 12,
-                                color: COLORS.muted,
-                                marginBottom: 4,
-                              }}
-                            >
-                              Seleccionado:
-                            </Text>
-                            <Text
-                              style={{
-                                fontSize: 13,
-                                color: COLORS.title,
-                                fontWeight: "800",
-                              }}
-                            >
-                              {notFoundSelected.Descripcion || "—"}
-                            </Text>
-                            <Text style={{ fontSize: 12, color: COLORS.text }}>
-                              {notFoundSelected.Material || "—"}
-                            </Text>
-                          </View>
-                        )}
-
-                        <Text style={[styles.fieldLabel, { marginTop: 10 }]}>
-                          Tipo para “no encontrado”
-                        </Text>
-                        <View style={styles.toggleRow}>
-                          <TouchableOpacity
-                            style={[
-                              styles.toggleChip,
-                              c.MultiTrackingno === "02" &&
-                                styles.toggleChipActive,
-                            ]}
-                            onPress={() =>
-                              updateComponent(
-                                opIndex,
-                                compIndex,
-                                "MultiTrackingno",
-                                "02",
-                              )
-                            }
-                            activeOpacity={0.85}
-                          >
-                            <Text
-                              style={[
-                                styles.toggleText,
-                                c.MultiTrackingno === "02" &&
-                                  styles.toggleTextActive,
-                              ]}
-                            >
-                              Préstamo
-                            </Text>
-                          </TouchableOpacity>
-
-                          <TouchableOpacity
-                            style={[
-                              styles.toggleChip,
-                              c.MultiTrackingno === "01" &&
-                                styles.toggleChipActive,
-                            ]}
-                            onPress={() =>
-                              updateComponent(
-                                opIndex,
-                                compIndex,
-                                "MultiTrackingno",
-                                "01",
-                              )
-                            }
-                            activeOpacity={0.85}
-                          >
-                            <Text
-                              style={[
-                                styles.toggleText,
-                                c.MultiTrackingno === "01" &&
-                                  styles.toggleTextActive,
-                              ]}
-                            >
-                              Oferta
-                            </Text>
-                          </TouchableOpacity>
-                        </View>
-
-                        <TouchableOpacity
-                          style={[
-                            styles.smallBtn,
-                            {
-                              alignSelf: "flex-start",
-                              marginBottom: 8,
-                              backgroundColor: COLORS.cardBg,
-                            },
-                          ]}
-                          onPress={() =>
-                            updateComponent(
-                              opIndex,
-                              compIndex,
-                              "MultiSelected",
-                              [],
-                            )
-                          }
-                        >
-                          <Text style={styles.smallBtnText}>
-                            Quitar selección
-                          </Text>
-                        </TouchableOpacity>
-                      </>
-                    )}
-
-                    <Field
-                      label="Cantidad requerida"
-                      value={c.RequirementQuantity}
-                      onChangeText={(txt) =>
-                        updateComponent(
-                          opIndex,
-                          compIndex,
-                          "RequirementQuantity",
-                          String(txt || "").replace(/[^0-9.]/g, ""),
-                        )
-                      }
-                      placeholder="Ej. 2"
-                      keyboardType="numeric"
-                    />
-
-                    <Field
-                      label="Almacén"
-                      value={c.StgeLoc}
-                      onChangeText={(txt) =>
-                        updateComponent(opIndex, compIndex, "StgeLoc", txt)
-                      }
-                      placeholder="BHER"
-                    />
                   </View>
                 );
               })}
-              <View style={styles.operationDivider} />
 
-              <TouchableOpacity
-                style={styles.btnSecondary}
-                onPress={() => addComponentToOp(opIndex)}
-              >
-                <Ionicons
-                  name="add-circle-outline"
-                  size={18}
-                  color={COLORS.accent}
-                />
-                <Text style={styles.btnSecondaryText}>
-                  Agregar material a esta operación
-                </Text>
+
+              <TouchableOpacity style={styles.btnAddOperationBtn} onPress={addOperation}>
+                <Ionicons name="add-circle" size={18} color="#fff" />
+                <Text style={styles.btnAddOperationText}>+ ¿Requiere otra tarea u operación?</Text>
               </TouchableOpacity>
             </View>
-          ))}
 
-          <TouchableOpacity style={styles.btnSecondary} onPress={addOperation}>
-            <Ionicons
-              name="add-circle-outline"
-              size={18}
-              color={COLORS.accent}
-            />
-            <Text style={styles.btnSecondaryText}>Agregar operación</Text>
-          </TouchableOpacity>
-        </View>
+            <Pressable
+              style={styles.btnPrimary}
+              onPress={() => {
+                const hayIncompletas = operations.some(op => !op.Description.trim() || !op.DurationNormal);
+                if (hayIncompletas) {
+                  return Alert.alert(
+                    "Faltan detalles de la tarea", 
+                    "Por favor asegúrate de indicar la descripción y la duración en horas de cada operación antes de continuar."
+                  );
+                }
+                handleIrAVistaPrevia();
+              }}
+            >
+              <View style={styles.btnPrimaryContent}>
+                <Text style={styles.btnPrimaryText}>Revisar Resumen y Vista Previa</Text>
+                <Ionicons name="eye-outline" size={18} color="#fff" style={{ marginLeft: 6 }} />
+              </View>
+            </Pressable>
+          </>
+        )}
 
-        {/* ✅ Personas (solo UI por ahora) */}
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Asignación</Text>
-          <Text style={styles.sectionSubtitle}>
-            Selecciona cuántas personas se asignarán (por ahora solo se
-            muestra).
-          </Text>
 
-          <SelectNumber
-            label="Seleccione el número de personas que se asignarán"
-            value={peopleCount}
-            min={1}
-            max={20}
-            onSelect={setPeopleCount}
-          />
-        </View>
 
-        {/* Guardar */}
-        <Pressable
-          android_ripple={{ color: "rgba(255,255,255,0.2)" }}
-          style={({ pressed }) => [
-            styles.btnPrimary,
-            pressed && styles.btnPrimaryPressed,
-            saving && styles.btnPrimaryDisabled,
-          ]}
-          onPress={onGuardar}
-          disabled={saving}
-        >
-          {saving ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <View style={styles.btnPrimaryContent}>
-              <Ionicons
-                name="save-outline"
-                size={18}
-                color="#fff"
-                style={{ marginRight: 6 }}
-              />
-              <Text style={styles.btnPrimaryText}>
-                Crear orden de mantenimiento
+        {/* ======================================================== */}
+        {/* ETAPA 3: RESUMEN Y VISTA PREVIA ANTES DE GUARDAR */}
+        {/* ======================================================== */}
+        {step === 3 && payloadPreview && (
+          <>
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>3. Resumen y Confirmación</Text>
+              <Text style={styles.sectionSubtitle}>
+                Verifica la estructura de tareas y materiales antes de transmitir la orden a SAP.
               </Text>
+
+              <Text style={styles.previewSectionTitle}>Cabecera de la Orden</Text>
+              <View style={styles.previewBox}>
+                <Text style={styles.previewText}>Tipo: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.OrderType}</Text></Text>
+                <Text style={styles.previewText}>Centro (Planplant): <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.Planplant}</Text></Text>
+                <Text style={styles.previewText}>Técnico (MnWkCtr): <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.MnWkCtr}</Text></Text>
+                <Text style={styles.previewText}>Equipo: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.Equipment || "—"}</Text></Text>
+                <Text style={styles.previewText}>Texto Breve: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.ShortText}</Text></Text>
+                <Text style={styles.previewText}>Inicio: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.StartDate}</Text></Text>
+                <Text style={styles.previewText}>Fin: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.FinishDate}</Text></Text>
+                <Text style={styles.previewText}>Aviso Referencia: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.NotifNo}</Text></Text>
+              </View>
+
+              <Text style={styles.previewSectionTitle}>Operaciones y Materiales Asignados</Text>
+              
+              {/* 🧠 AGRUPACIÓN VISUAL: Recorremos cada operación y le asociamos sus componentes */}
+              {payloadPreview.WorkOrderOperationSet.map((op, i) => {
+                // Filtramos los componentes que pertenecen exactamente a esta actividad
+                const componentesDeEstaOperacion = payloadPreview.WorkOrderComponentSet.filter(
+                  (comp) => String(comp.Activity) === String(op.Activity)
+                );
+
+                return (
+                  <View key={`res-op-${i}`} style={styles.previewOpGroupCard}>
+                    {/* Encabezado de la Tarea / Operación */}
+                    <View style={styles.previewOpHeaderRow}>
+                      <View style={styles.previewOpBadge}>
+                        <Text style={styles.previewOpBadgeText}>Actividad {op.Activity}</Text>
+                      </View>
+                      <Text style={styles.previewOpTitle}>Operación {i + 1}</Text>
+                    </View>
+
+                    <Text style={styles.previewText}>Descripción: <Text style={styles.previewValue}>{op.Description}</Text></Text>
+                    <Text style={styles.previewText}>Duración: <Text style={styles.previewValue}>{op.DurationNormal} hrs</Text></Text>
+                    <Text style={styles.previewText}>Capacidad personas: <Text style={styles.previewValue}>{op.NumberOfCapacities}</Text></Text>
+
+                    <View style={styles.operationDivider} />
+
+                    {/* Subsección de Materiales de esta Operación específica */}
+                    <Text style={styles.previewSubSectionTitle}>
+                      Materiales / Refacciones ({componentesDeEstaOperacion.length})
+                    </Text>
+
+                    {componentesDeEstaOperacion.length === 0 ? (
+                      <Text style={{ fontSize: 11, color: COLORS.muted, fontStyle: "italic", marginBottom: 4 }}>
+                        Sin materiales asignados a esta operación.
+                      </Text>
+                    ) : (
+                      // Buscamos el componente real en el state 'operations' para pintar su DescripcionVisual
+                      operations.find(o => String(o.Activity) === String(op.Activity))?.Components?.map((comp, j) => (
+                        <View key={`res-comp-${j}`} style={styles.previewComponentBox}>
+                          <Text style={styles.previewText}>Item: <Text style={styles.previewValue}>{comp.ItemNumber}</Text></Text>
+                          <Text style={styles.previewText}>Material: <Text style={styles.previewValue}>{comp.DescripcionVisual || (comp.MultiSelected || [])[0]?.Descripcion || comp.Material}</Text></Text>
+                          <Text style={styles.previewText}>Código ID: <Text style={styles.previewValue}>{comp.Material || (comp.MultiSelected || [])[0]?.Material}</Text></Text>
+                          <Text style={styles.previewText}>Cantidad: <Text style={styles.previewValue}>{comp.RequirementQuantity || "—"}</Text></Text>
+                          <Text style={styles.previewText}>Almacén: <Text style={styles.previewValue}>{comp.StgeLoc || "—"}</Text></Text>
+                        </View>
+                      ))
+                    )}
+                  </View>
+                );
+              })}
             </View>
-          )}
-        </Pressable>
+
+            {/* 🔄 BOTONES DE ACCIÓN EN RESUMEN: EDITAR O GUARDAR */}
+            <View style={{ flexDirection: "row", gap: 10, marginTop: 14 }}>
+              <TouchableOpacity
+                style={[styles.btnSecondary, { flex: 1, paddingVertical: 12, justifyContent: "center", backgroundColor: "#F1F5F9", borderRadius: 12, borderWidth: 1, borderColor: COLORS.border }]}
+                onPress={() => setStep(2)}
+              >
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  <Ionicons name="arrow-back-outline" size={16} color={COLORS.accent} />
+                  <Text style={[styles.btnSecondaryText, { marginTop: 0 }]}>Editar operaciones</Text>
+                </View>
+              </TouchableOpacity>
+
+              <Pressable
+                style={({ pressed }) => [
+                  styles.btnPrimary,
+                  { flex: 1, backgroundColor: "#166534", marginTop: 0 },
+                  pressed && styles.btnPrimaryPressed,
+                  saving && styles.btnPrimaryDisabled,
+                ]}
+                onPress={onConfirmarGuardado}
+                disabled={saving}
+              >
+                {saving ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <View style={styles.btnPrimaryContent}>
+                    <Ionicons name="save-outline" size={18} color="#fff" style={{ marginRight: 6 }} />
+                    <Text style={styles.btnPrimaryText}>Guardar en SAP</Text>
+                  </View>
+                )}
+              </Pressable>
+            </View>
+          </>
+        )}
+
+
 
         <View style={{ height: 30 }} />
       </ScrollView>
@@ -1729,266 +1842,266 @@ export default function CrearOrdenMantto() {
             </View>
 
             <ScrollView
-              style={{ maxHeight: 320 }}
-              contentContainerStyle={{ paddingVertical: 8 }}
-            >
-              {(() => {
-                const op = operations[multiOpIndex] || {};
-                const c = (op.Components || [])[multiCompIndex] || {};
-                const q = String(multiQuery || "")
-                  .trim()
-                  .toLowerCase();
+        style={{ maxHeight: 320 }}
+        contentContainerStyle={{ paddingVertical: 8 }}
+      >
+        {(() => {
+          const op = operations[multiOpIndex] || {};
+          const c = (op.Components || [])[multiCompIndex] || {};
+          const q = String(multiQuery || "")
+            .trim()
+            .toLowerCase();
 
-                if (!c.NotFound) {
-                  return (
-                    <View
-                      style={{ paddingHorizontal: 14, paddingVertical: 10 }}
-                    >
-                      <Text style={{ color: COLORS.muted, fontSize: 12 }}>
-                        Este selector es solo para “Material no encontrado
-                        (BOM)”.
-                      </Text>
-                    </View>
-                  );
-                }
+          if (!c.NotFound) {
+            return (
+              <View
+                style={{ paddingHorizontal: 14, paddingVertical: 10 }}
+              >
+                <Text style={{ color: COLORS.muted, fontSize: 12 }}>
+                  Este selector es solo para “Material no encontrado (BOM)”.
+                </Text>
+              </View>
+            );
+          }
 
-                const cats = c.NotFoundCategories || [];
-                const zeinr = String(c.NotFoundCategory || "").trim();
+          const cats = c.NotFoundCategories || [];
+          const zeinr = String(c.NotFoundCategory || "").trim();
 
-                // Paso 1: elegir categoría
-                if (!zeinr) {
-                  if (c.LoadingNotFoundCategories) {
-                    return (
-                      <View style={{ paddingVertical: 16 }}>
-                        <ActivityIndicator color={COLORS.accent} />
-                      </View>
-                    );
+          // Paso 1: elegir categoría
+          if (!zeinr) {
+            if (c.LoadingNotFoundCategories) {
+              return (
+                <View style={{ paddingVertical: 16 }}>
+                  <ActivityIndicator color={COLORS.accent} />
+                </View>
+              );
+            }
+
+            const filteredCats = !q
+              ? cats
+              : cats.filter((x) =>
+                  `${x.Texto || ""} ${x.Zeinr || ""}`
+                    .toLowerCase()
+                    .includes(q),
+                );
+
+            if (!filteredCats.length) {
+              return (
+                <View
+                  style={{ paddingHorizontal: 14, paddingVertical: 10 }}
+                >
+                  <Text style={{ color: COLORS.muted, fontSize: 12 }}>
+                    No hay categorías (o no hay resultados con esa búsqueda).
+                  </Text>
+                </View>
+              );
+            }
+
+            return filteredCats.map((cat, idx) => {
+              const key = `${cat.Zeinr}-${idx}`;
+              return (
+                <TouchableOpacity
+                  key={key}
+                  style={styles.workerRow}
+                  onPress={() =>
+                    loadNotFoundMaterialsByCategory(
+                      multiOpIndex,
+                      multiCompIndex,
+                      cat.Zeinr,
+                    )
                   }
+                  activeOpacity={0.7}
+                >
+                  <View style={[styles.checkbox, { opacity: 0.6 }]} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.workerName}>
+                      {cat.Texto || cat.Zeinr}
+                    </Text>
+                    <Text style={styles.materialCodeText}>
+                      {cat.Zeinr}
+                    </Text>
+                  </View>
+                  <Ionicons
+                    name="chevron-forward"
+                    size={16}
+                    color={COLORS.muted}
+                  />
+                </TouchableOpacity>
+              );
+            });
+          }
 
-                  const filteredCats = !q
-                    ? cats
-                    : cats.filter((x) =>
-                        `${x.Texto || ""} ${x.Zeinr || ""}`
-                          .toLowerCase()
-                          .includes(q),
-                      );
+          // Paso 2: elegir materiales BOM con inteligencia de pendientes y exclusión
+          const list = c.NotFoundMaterials || [];
 
-                  if (!filteredCats.length) {
-                    return (
-                      <View
-                        style={{ paddingHorizontal: 14, paddingVertical: 10 }}
-                      >
-                        <Text style={{ color: COLORS.muted, fontSize: 12 }}>
-                          No hay categorías (o no hay resultados con esa
-                          búsqueda).
-                        </Text>
-                        <TouchableOpacity
-                          style={[styles.btnMini, { marginTop: 10 }]}
-                          onPress={() =>
-                            ensureNotFoundCategories(
-                              multiOpIndex,
-                              multiCompIndex,
-                            )
-                          }
-                          activeOpacity={0.85}
-                        >
-                          <Ionicons
-                            name="refresh"
-                            size={16}
-                            color={COLORS.accent}
-                          />
-                          <Text style={styles.btnMiniText}>Reintentar</Text>
-                        </TouchableOpacity>
-                      </View>
-                    );
-                  }
+          if (c.LoadingNotFoundMaterials) {
+            return (
+              <View style={{ paddingVertical: 16 }}>
+                <ActivityIndicator color={COLORS.accent} />
+              </View>
+            );
+          }
 
-                  return filteredCats.map((cat, idx) => {
-                    const key = `${cat.Zeinr}-${idx}`;
-                    return (
-                      <TouchableOpacity
-                        key={key}
-                        style={styles.workerRow}
-                        onPress={() =>
-                          loadNotFoundMaterialsByCategory(
-                            multiOpIndex,
-                            multiCompIndex,
-                            cat.Zeinr,
-                          )
-                        }
-                        activeOpacity={0.7}
-                      >
-                        <View style={[styles.checkbox, { opacity: 0.6 }]} />
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.workerName}>
-                            {cat.Texto || cat.Zeinr}
-                          </Text>
-                          <Text style={styles.materialCodeText}>
-                            {cat.Zeinr}
-                          </Text>
-                        </View>
-                        <Ionicons
-                          name="chevron-forward"
-                          size={16}
-                          color={COLORS.muted}
-                        />
-                      </TouchableOpacity>
-                    );
+          if (!list.length) {
+            return (
+              <View
+                style={{ paddingHorizontal: 14, paddingVertical: 10 }}
+              >
+                <Text style={{ color: COLORS.muted, fontSize: 12 }}>
+                  No hay materiales BOM para: {zeinr}
+                </Text>
+              </View>
+            );
+          }
+
+          const piezasPendientesModal = obtenerPiezasPendientesDeSugerir(op.Components || [], piezasAviso);
+          const piezaObjetivoActual = piezasPendientesModal[0] || piezasAviso[multiCompIndex] || piezasAviso[0] || "";
+
+          const matchesPieza = (matDesc) => {
+            if (!matDesc || !piezaObjetivoActual) return false;
+            const desc = matDesc.toLowerCase();
+            const palabras = piezaObjetivoActual.toLowerCase().split(/\s+/);
+            return palabras.some((palabra) => palabra.length > 2 && desc.includes(palabra));
+          };
+
+          const tieneAlgunaSugerencia = list.some((m) => matchesPieza(m.Ojtxp));
+
+          const codigosYaSeleccionadosEnOtrosItems = (op.Components || [])
+            .filter((cc, ci) => ci !== multiCompIndex && (cc.MultiSelected || []).length > 0)
+            .map((cc) => cc.MultiSelected[0].Material);
+
+          const filtered = list
+            .filter((m) => {
+              if (codigosYaSeleccionadosEnOtrosItems.includes(m.Idnrk)) return false;
+
+              if (!q) return true;
+              return `${m.Ojtxp || ""} ${m.Idnrk || ""}`
+                .toLowerCase()
+                .includes(q);
+            })
+            .sort((a, b) => {
+              const matchA = matchesPieza(a.Ojtxp);
+              const matchB = matchesPieza(b.Ojtxp);
+              if (matchA && !matchB) return -1;
+              if (!matchA && matchB) return 1;
+              return 0;
+            });
+
+          const selected0 = (c.MultiSelected || [])[0]?.Material || null;
+
+          return (
+            <>
+              {/* 🔄 BOTÓN PARA CAMBIAR DE UBICACIÓN / CATEGORÍA SI EL MECÁNICO SE EQUIVOCÓ */}
+              <TouchableOpacity
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  paddingHorizontal: 14,
+                  paddingVertical: 10,
+                  backgroundColor: "#EFF6FF",
+                  borderBottomWidth: 1,
+                  borderBottomColor: COLORS.border,
+                  gap: 8,
+                }}
+                onPress={() => {
+                  setOperations((prev) => {
+                    const nextOps = prev.map((o, oi) => {
+                      if (oi !== multiOpIndex) return o;
+                      const comps = (o.Components || []).map((cc, ci) => {
+                        if (ci !== multiCompIndex) return cc;
+                        return { ...cc, NotFoundCategory: "", NotFoundMaterials: [] };
+                      });
+                      return { ...o, Components: comps };
+                    });
+                    return normalizeOpsAndComponents(nextOps, planPlant);
                   });
-                }
+                }}
+              >
+                <Ionicons name="arrow-back" size={16} color={COLORS.accent} />
+                <Text style={{ fontSize: 12, fontWeight: "800", color: COLORS.accent, flex: 1 }}>
+                  Ubicación: {zeinr} (Toca aquí para cambiar de categoría)
+                </Text>
+              </TouchableOpacity>
 
-                // Paso 2: elegir materiales BOM (✅ solo 1)
-                const list = c.NotFoundMaterials || [];
+              {!tieneAlgunaSugerencia && piezasAviso.length > 0 && !q && (
+                <View style={styles.bannerAvisoSinMatch}>
+                  <Ionicons name="information-circle-outline" size={16} color="#D97706" style={{ marginRight: 6 }} />
+                  <Text style={styles.bannerAvisoText}>
+                    Mostrando el catálogo completo para este equipo.
+                  </Text>
+                </View>
+              )}
 
-                if (c.LoadingNotFoundMaterials) {
-                  return (
-                    <View style={{ paddingVertical: 16 }}>
-                      <ActivityIndicator color={COLORS.accent} />
-                    </View>
-                  );
-                }
+              {filtered.map((m, idx) => {
+                const checked = selected0 === m.Idnrk;
+                const key = `${m.Idnrk}-${idx}`;
+                const esSugerenciaTecnico = matchesPieza(m.Ojtxp);
 
-                if (!list.length) {
-                  return (
-                    <View
-                      style={{ paddingHorizontal: 14, paddingVertical: 10 }}
-                    >
-                      <Text style={{ color: COLORS.muted, fontSize: 12 }}>
-                        No hay materiales BOM para: {zeinr}
-                      </Text>
+                return (
+                  <TouchableOpacity
+                    key={key}
+                    style={[
+                      styles.workerRow,
+                      esSugerenciaTecnico && { backgroundColor: "#F0FDF4" },
+                    ]}
+                    onPress={() => {
+                      setOperations((prev) => {
+                        const nextOps = prev.map((o, oi) => {
+                          if (oi !== multiOpIndex) return o;
+                          const comps = (o.Components || []).map((cc, ci) => {
+                            if (ci !== multiCompIndex) return cc;
 
-                      <View
-                        style={{ flexDirection: "row", gap: 10, marginTop: 10 }}
-                      >
-                        <TouchableOpacity
-                          style={[
-                            styles.smallBtn,
-                            { backgroundColor: COLORS.cardBg },
-                          ]}
-                          onPress={() =>
-                            setOperations((prev) => {
-                              const nextOps = prev.map((o, oi) => {
-                                if (oi !== multiOpIndex) return o;
-                                const comps = (o.Components || []).map(
-                                  (cc, ci) => {
-                                    if (ci !== multiCompIndex) return cc;
-                                    return {
-                                      ...cc,
-                                      NotFoundCategory: "",
-                                      NotFoundMaterials: [],
-                                      MultiSelected: [],
-                                    };
-                                  },
-                                );
-                                return { ...o, Components: comps };
-                              });
-                              return normalizeOpsAndComponents(
-                                nextOps,
-                                planPlant,
-                              );
-                            })
-                          }
-                        >
-                          <Text style={styles.smallBtnText}>
-                            Cambiar categoría
-                          </Text>
-                        </TouchableOpacity>
+                            const curr =
+                              (cc.MultiSelected || [])[0]?.Material || null;
+                            const nextSel =
+                              curr === m.Idnrk
+                                ? []
+                                : [
+                                    {
+                                      Material: m.Idnrk,
+                                      Descripcion: m.Ojtxp,
+                                    },
+                                  ];
 
-                        <TouchableOpacity
-                          style={[
-                            styles.smallBtn,
-                            {
-                              backgroundColor: COLORS.accent,
-                              borderColor: COLORS.accent,
-                            },
-                          ]}
-                          onPress={() =>
-                            loadNotFoundMaterialsByCategory(
-                              multiOpIndex,
-                              multiCompIndex,
-                              zeinr,
-                            )
-                          }
-                        >
-                          <Text
-                            style={[styles.smallBtnText, { color: "#fff" }]}
-                          >
-                            Reintentar
-                          </Text>
-                        </TouchableOpacity>
-                      </View>
-                    </View>
-                  );
-                }
-
-                const filtered = !q
-                  ? list
-                  : list.filter((m) =>
-                      `${m.Ojtxp || ""} ${m.Idnrk || ""}`
-                        .toLowerCase()
-                        .includes(q),
-                    );
-
-                const selected0 = (c.MultiSelected || [])[0]?.Material || null;
-
-                return filtered.map((m, idx) => {
-                  const checked = selected0 === m.Idnrk;
-                  const key = `${m.Idnrk}-${idx}`;
-
-                  return (
-                    <TouchableOpacity
-                      key={key}
-                      style={styles.workerRow}
-                      onPress={() => {
-                        // ✅ solo 1: si selecciona otro, reemplaza; si toca el mismo, lo quita
-                        setOperations((prev) => {
-                          const nextOps = prev.map((o, oi) => {
-                            if (oi !== multiOpIndex) return o;
-                            const comps = (o.Components || []).map((cc, ci) => {
-                              if (ci !== multiCompIndex) return cc;
-
-                              const curr =
-                                (cc.MultiSelected || [])[0]?.Material || null;
-                              const nextSel =
-                                curr === m.Idnrk
-                                  ? []
-                                  : [
-                                      {
-                                        Material: m.Idnrk,
-                                        Descripcion: m.Ojtxp,
-                                      },
-                                    ];
-
-                              return { ...cc, MultiSelected: nextSel };
-                            });
-                            return { ...o, Components: comps };
+                            return { ...cc, MultiSelected: nextSel };
                           });
-                          return normalizeOpsAndComponents(nextOps, planPlant);
+                          return { ...o, Components: comps };
                         });
-                      }}
-                      activeOpacity={0.7}
+                        return normalizeOpsAndComponents(nextOps, planPlant);
+                      });
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <View
+                      style={[
+                        styles.checkbox,
+                        checked && styles.checkboxChecked,
+                      ]}
                     >
-                      <View
-                        style={[
-                          styles.checkbox,
-                          checked && styles.checkboxChecked,
-                        ]}
-                      >
-                        {checked && (
-                          <Ionicons name="checkmark" size={14} color="#fff" />
-                        )}
-                      </View>
-                      <View style={{ flex: 1 }}>
+                      {checked && (
+                        <Ionicons name="checkmark" size={14} color="#fff" />
+                      )}
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                         <Text style={styles.workerName}>
                           {m.Ojtxp || m.Idnrk}
                         </Text>
-                        <Text style={styles.materialCodeText}>{m.Idnrk}</Text>
+                        {esSugerenciaTecnico && (
+                          <View style={styles.badgeSugerencia}>
+                            <Text style={styles.badgeSugerenciaText}>⭐ Sugerido</Text>
+                          </View>
+                        )}
                       </View>
-                    </TouchableOpacity>
-                  );
-                });
-              })()}
-            </ScrollView>
+                      <Text style={styles.materialCodeText}>{m.Idnrk}</Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
+            </>
+          );
+        })()}
+      </ScrollView>
 
             <View style={styles.modalFooterRow}>
               <TouchableOpacity
@@ -2126,7 +2239,6 @@ export default function CrearOrdenMantto() {
 
                       const picked = selectedDate || dtPickerTemp;
                       if (dtPickerStep === "date") {
-                        // conserva la hora actual del temp, pero cambia fecha
                         const next = new Date(dtPickerTemp);
                         next.setFullYear(
                           picked.getFullYear(),
@@ -2138,7 +2250,6 @@ export default function CrearOrdenMantto() {
                         return;
                       }
 
-                      // time
                       const next = new Date(dtPickerTemp);
                       next.setHours(
                         picked.getHours(),
@@ -2186,191 +2297,6 @@ const Field = ({ label, value, onChangeText, placeholder, keyboardType }) => (
   </View>
 );
 
-/** Selector de centro de trabajo (técnico) */
-const SelectWorkCenter = ({ items, selected, onSelect }) => {
-  const [visible, setVisible] = useState(false);
-  const [query, setQuery] = useState("");
-
-  const label = selected
-    ? `${selected.Ktext} (${selected.Arbpl})`
-    : "Seleccionar técnico / centro";
-  const normalized = (s) =>
-    String(s || "")
-      .toLowerCase()
-      .trim();
-
-  const filteredItems = !query.trim()
-    ? items
-    : items.filter((wc) => {
-        const q = normalized(query);
-        return (
-          normalized(wc.Ktext).includes(q) || normalized(wc.Arbpl).includes(q)
-        );
-      });
-
-  return (
-    <>
-      <TouchableOpacity
-        style={[styles.input, styles.multiInput]}
-        onPress={() => {
-          setVisible(true);
-          setQuery("");
-        }}
-        activeOpacity={0.7}
-      >
-        <Text
-          style={{
-            fontSize: 13,
-            color: selected ? COLORS.title : COLORS.muted,
-          }}
-          numberOfLines={2}
-        >
-          {label}
-        </Text>
-        <Ionicons
-          name="chevron-down-outline"
-          size={18}
-          color={COLORS.muted}
-          style={{ marginLeft: 6 }}
-        />
-      </TouchableOpacity>
-
-      <Modal
-        visible={visible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setVisible(false)}
-      >
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>
-                Seleccionar técnico / centro
-              </Text>
-              <TouchableOpacity
-                onPress={() => setVisible(false)}
-                style={styles.modalCloseBtn}
-              >
-                <Ionicons name="close" size={18} color="#fff" />
-              </TouchableOpacity>
-            </View>
-
-            <View style={{ padding: 12, paddingBottom: 6 }}>
-              <View
-                style={[
-                  styles.input,
-                  {
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: 8,
-                    backgroundColor: "#fff",
-                  },
-                ]}
-              >
-                <Ionicons name="search" size={16} color={COLORS.muted} />
-                <TextInput
-                  style={{ flex: 1, fontSize: 13, color: COLORS.title }}
-                  value={query}
-                  onChangeText={setQuery}
-                  placeholder="Buscar por nombre o Arbpl..."
-                  placeholderTextColor={COLORS.muted}
-                  autoCorrect={false}
-                  autoCapitalize="none"
-                />
-                {!!query && (
-                  <TouchableOpacity onPress={() => setQuery("")} hitSlop={8}>
-                    <Ionicons
-                      name="close-circle"
-                      size={18}
-                      color={COLORS.muted}
-                    />
-                  </TouchableOpacity>
-                )}
-              </View>
-
-              <Text style={{ fontSize: 11, color: COLORS.muted, marginTop: 6 }}>
-                {filteredItems.length} resultado(s)
-              </Text>
-            </View>
-
-            <ScrollView
-              style={{ maxHeight: 280 }}
-              contentContainerStyle={{ paddingVertical: 8 }}
-            >
-              {filteredItems.map((wc, index) => {
-                const checked = selected?.Arbpl === wc.Arbpl;
-                const key = wc.Arbpl ? `${wc.Arbpl}-${index}` : `wc-${index}`;
-
-                return (
-                  <TouchableOpacity
-                    key={key}
-                    style={styles.workerRow}
-                    onPress={() => {
-                      onSelect(wc);
-                      setVisible(false);
-                    }}
-                    activeOpacity={0.7}
-                  >
-                    <View
-                      style={[
-                        styles.checkbox,
-                        checked && styles.checkboxChecked,
-                      ]}
-                    >
-                      {checked && (
-                        <Ionicons name="checkmark" size={14} color="#fff" />
-                      )}
-                    </View>
-                    <Text style={styles.workerName}>
-                      {wc.Ktext} ({wc.Arbpl})
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
-
-              {!filteredItems.length && (
-                <View style={{ paddingHorizontal: 14, paddingVertical: 10 }}>
-                  <Text style={{ color: COLORS.muted, fontSize: 12 }}>
-                    No hay resultados con esa búsqueda.
-                  </Text>
-                </View>
-              )}
-            </ScrollView>
-
-            <View style={styles.modalFooterRow}>
-              <TouchableOpacity
-                style={[styles.smallBtn, { backgroundColor: COLORS.cardBg }]}
-                onPress={() => {
-                  onSelect(null);
-                  setQuery("");
-                }}
-              >
-                <Text style={styles.smallBtnText}>Limpiar</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[
-                  styles.smallBtn,
-                  {
-                    backgroundColor: COLORS.accent,
-                    borderColor: COLORS.accent,
-                  },
-                ]}
-                onPress={() => setVisible(false)}
-              >
-                <Text style={[styles.smallBtnText, { color: "#fff" }]}>
-                  Listo
-                </Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
-    </>
-  );
-};
-
-/** Selector de material */
 const SelectMaterial = ({ items, value, onSelect, disabled }) => {
   const [visible, setVisible] = useState(false);
 
@@ -2503,7 +2429,6 @@ const SelectMaterial = ({ items, value, onSelect, disabled }) => {
   );
 };
 
-/** ✅ Selector dinámico de número (modal) */
 const SelectNumber = ({ label, value, min = 1, max = 20, onSelect }) => {
   const [visible, setVisible] = useState(false);
 
@@ -2623,6 +2548,31 @@ const styles = StyleSheet.create({
 
   backRow: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
   backText: { marginLeft: 4, color: COLORS.accent, fontWeight: "600" },
+
+  wizardIndicatorRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 16,
+    gap: 8,
+  },
+  wizardStepBadge: {
+    flex: 1,
+    paddingVertical: 8,
+    alignItems: "center",
+    backgroundColor: "#E2E8F0",
+    borderRadius: 8,
+  },
+  wizardStepActive: {
+    backgroundColor: COLORS.accent,
+  },
+  wizardStepText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: COLORS.text,
+  },
+  wizardTextActive: {
+    color: "#FFFFFF",
+  },
 
   cardHighlight: {
     backgroundColor: COLORS.cardBg,
@@ -2911,34 +2861,347 @@ const styles = StyleSheet.create({
     opacity: 0.6,
   },
 
-  softDivider: {
-    height: 1,
-    backgroundColor: COLORS.border,
-    marginVertical: 10,
-    opacity: 0.5,
+  sugerenciaCard: {
+    backgroundColor: "#EFF6FF",
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: "#BFDBFE",
+    ...elev(1),
   },
+  sugerenciaTitle: { fontSize: 13, fontWeight: "800", color: "#1E3A8A" },
+  sugerenciaSub: { fontSize: 11, color: "#64748B", marginTop: 8 },
+  badgePiezaReportada: { 
+    backgroundColor: "#FFFFFF", 
+    paddingHorizontal: 10, 
+    paddingVertical: 5, 
+    borderRadius: 8, 
+    borderWidth: 1, 
+    borderColor: "#DBEAFE" 
+  },
+  badgePiezaText: { fontSize: 12, fontWeight: "700", color: "#1E40AF" },
 
-  notFoundRow: {
+  bannerAvisoSinMatch: {
     flexDirection: "row",
     alignItems: "flex-start",
-    gap: 10,
-    padding: 12,
-    borderRadius: 14,
+    backgroundColor: "#FEF3C7",
+    marginHorizontal: 12,
+    marginBottom: 10,
+    padding: 10,
+    borderRadius: 10,
     borderWidth: 1,
-    borderColor: COLORS.border,
-    backgroundColor: "#FAFBFF",
-    marginBottom: 12,
+    borderColor: "#FDE68A",
+  },
+  bannerAvisoText: {
+    fontSize: 11,
+    color: "#92400E",
+    fontWeight: "600",
+    flex: 1,
+    lineHeight: 16,
+  },
+  badgeSugerencia: {
+    backgroundColor: "#DCFCE7",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#BBF7D0",
+  },
+  badgeSugerenciaText: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#166534",
   },
 
-  notFoundTitle: {
+  previewSectionTitle: {
     fontSize: 13,
     fontWeight: "800",
+    color: COLORS.accent,
+    marginBottom: 6,
+    marginTop: 10,
+  },
+  previewBox: {
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+  },
+  previewText: {
+    fontSize: 12,
+    color: COLORS.text,
+    marginBottom: 2,
+  },
+  previewValue: {
+    fontWeight: "700",
     color: COLORS.title,
   },
-
-  notFoundSubtitle: {
-    fontSize: 11,
-    color: COLORS.muted,
-    marginTop: 2,
+  opHeaderMain: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 10,
+    backgroundColor: "#EFF6FF",
+    padding: 8,
+    borderRadius: 10,
   },
+  opBadgeActivity: {
+    backgroundColor: COLORS.accent,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    marginRight: 8,
+  },
+  opBadgeText: { fontSize: 11, fontWeight: "800", color: "#FFF" },
+  opTitleHeader: { flex: 1, fontSize: 13, fontWeight: "800", color: COLORS.title },
+
+  toggleChipSmall: {
+    flex: 1,
+    paddingVertical: 6,
+    alignItems: "center",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: "#F7F8FC",
+  },
+  toggleTextSmall: { fontSize: 11, fontWeight: "700", color: COLORS.text },
+
+  subSectionHeader: { fontSize: 13, fontWeight: "800", color: COLORS.title },
+  subSectionHint: { fontSize: 11, color: COLORS.muted, fontStyle: "italic" },
+
+  materialCardHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 6,
+  },
+  materialCardTitle: { fontSize: 12, fontWeight: "700", color: COLORS.text },
+
+  btnBomSelect: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: "#EFF6FF",
+    borderWidth: 1,
+    borderColor: "#BFDBFE",
+    borderRadius: 10,
+    paddingVertical: 10,
+    marginBottom: 8,
+  },
+  btnBomSelectText: { fontSize: 12, fontWeight: "800", color: COLORS.accent },
+
+  selectedBimBox: {
+    backgroundColor: "#F0FDF4",
+    borderWidth: 1,
+    borderColor: "#BBF7D0",
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+  },
+
+  btnAddOperationBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: COLORS.accent,
+    paddingVertical: 12,
+    borderRadius: 12,
+    marginTop: 6,
+    gap: 6,
+    ...elev(1),
+  },
+  btnAddOperationText: { color: "#FFF", fontWeight: "800", fontSize: 13 },
+
+  materialSectionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 10,
+    marginBottom: 2,
+  },
+
+  btnAddConsumibleBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 6,
+    paddingVertical: 8,
+    backgroundColor: "#F8FAFC",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderStyle: "dashed",
+  },
+  btnAddMaterialText: { marginLeft: 4, fontSize: 12, fontWeight: "700", color: COLORS.accent },
+
+  btnAddRefaccionBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 6,
+    paddingVertical: 8,
+    backgroundColor: "#F0FDF4",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#BBF7D0",
+    borderStyle: "dashed",
+  },
+  btnAddRefaccionText: { marginLeft: 4, fontSize: 12, fontWeight: "700", color: "#166534" },
+
+  cardAsistencia: {
+    backgroundColor: "#EFF6FF",
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#BFDBFE",
+  },
+  asistenciaTitle: { fontSize: 13, fontWeight: "800", color: "#1E3A8A" },
+  asistenciaText: { fontSize: 11, color: "#1E40AF", marginTop: 2, lineHeight: 15 },
+
+  fieldLabelQuestion: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: COLORS.title,
+    marginBottom: 4,
+    marginTop: 6,
+  },
+
+  inputHelperText: {
+    fontSize: 10,
+    color: "#64748B",
+    marginTop: 3,
+    fontStyle: "italic",
+  },
+  previewOpGroupCard: {
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+  },
+  previewOpHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  previewOpBadge: {
+    backgroundColor: COLORS.accent,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 6,
+    marginRight: 8,
+  },
+  previewOpBadgeText: { fontSize: 11, fontWeight: "800", color: "#FFF" },
+  previewOpTitle: { fontSize: 13, fontWeight: "800", color: COLORS.title },
+  
+  previewSubSectionTitle: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: COLORS.title,
+    marginBottom: 6,
+    marginTop: 4,
+  },
+  previewComponentBox: {
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 8,
+    padding: 8,
+    marginBottom: 6,
+  },
+
+  pasoPreguntaContainer: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    marginBottom: 8,
+  },
+  pasoHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 6,
+  },
+  numeroPasoBadge: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: COLORS.accent,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+  },
+  numeroPasoText: {
+    color: "#FFFFFF",
+    fontWeight: "900",
+    fontSize: 11,
+  },
+  btnAsistenteDestacado: {
+    backgroundColor: "#F0FDF4",
+    borderWidth: 1,
+    borderColor: "#BBF7D0",
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 10,
+  },
+  btnAsistenteText: {
+    color: "#166534",
+    fontWeight: "800",
+    fontSize: 12,
+  },
+  preguntaCierreBomBox: {
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 8,
+  },
+  preguntaCierreText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: COLORS.title,
+  },
+  btnMiniAccionVerde: {
+    backgroundColor: "#DCFCE7",
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#BBF7D0",
+  },
+  btnMiniAccionVerdeText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#166534",
+  },
+  btnMiniAccionAzul: {
+    backgroundColor: "#DBEAFE",
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#BFDBFE",
+  },
+  btnMiniAccionAzulText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#1E40AF",
+  },
+  btnCierreAccion: {
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: "center",
+    borderWidth: 1,
+  },
+
+  
 });
