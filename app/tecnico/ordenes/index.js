@@ -1,4 +1,15 @@
 // app/tecnico/ordenes/index.js
+//
+// ============================================================================
+// CONVENCIÓN DE MARCAS (FMS)
+//   // FMS NUEVO - INICIO ... // FMS NUEVO - FIN
+//       Código agregado en esta revisión.
+//   // FMS ELIMINADO - INICIO ... // FMS ELIMINADO - FIN
+//       Código anterior que se retira. Se deja comentado para comparar
+//       "cómo estaba" contra "cómo quedó". Se puede borrar cuando se valide.
+//   // FMS REEMPLAZO: el bloque ELIMINADO y el NUEVO van seguidos.
+// Todo lo que no tiene marca queda exactamente igual que antes.
+// ============================================================================
 import React, {
   useEffect,
   useMemo,
@@ -34,6 +45,10 @@ import {
   setLocalStatusPatch,
   patchCacheOrdenesTecnicoList,
   patchCacheOrdenTecnicoDetail,
+   // FMS NUEVO - INICIO
+  markLocalStatusPatchSent,
+  overlayRecentStatusPatches,
+  // FMS NUEVO - FIN
 } from "../../../src/offline/ordenesTecnicoLocalPatch";
 import { useAuth } from "../../../src/context/AuthContext";
 import { useOrdenesTecnico } from "../../../src/context/OrdenesTecnicoContext";
@@ -43,7 +58,25 @@ import * as FileSystem from "expo-file-system/legacy";
 import { preloadAvisoAveriaCatalogos } from "../../../src/services/avisoAveriaSap";
 import { 
   buildWorkOrderBulkId,
+  // FMS NUEVO - INICIO
+  getOrCreateBulkId,
+  clearBulkId,
+  // FMS NUEVO - FIN
 } from "../../../src/utils/workOrderBulkId";
+import * as Device from "expo-device";
+
+// FMS NUEVO - INICIO
+import {
+  scheduleStatusConfirmation,
+  resumePendingConfirmations,
+} from "../../../src/offline/statusConfirmation";
+// FMS NUEVO - FIN
+
+// FMS NUEVO - INICIO
+import { subscribeBootstrapSync } from "../../../src/offline/bootstrapSyncTecnico";
+// FMS NUEVO - FIN
+
+import { debugOfflineStorage } from "../../../src/utils/offlineDebug";
 
 // ============================
 // Guarda EQUIPO activo para geolocalización
@@ -60,7 +93,34 @@ const TBMKY_STATUS_KEY = (orderId) =>
 const WORK_ORDER_BULK_ENDPOINT =
   "/api/odata/ZCS_CHANGE_WORKORDER_SRV/WorkOrderBulkSet";
 
-function buildCheckinBulkPayload({ orderId, base64 }) {
+// FMS NUEVO - INICIO
+// Caché en memoria de periodos consultados fuera de la ventana offline.
+// - Vive a nivel de módulo, así sobrevive aunque la pantalla se desmonte
+//   (por ejemplo al entrar al detalle de una orden y regresar).
+// - NO escribe en AsyncStorage/SQLite; se pierde al cerrar la app.
+// - La llave incluye al usuario para no mezclar datos entre sesiones.
+const HISTORICAL_TTL_MS = 10 * 60 * 1000; // 10 min sin volver a consultar SAP
+const historicalMemoryCache = new Map(); // key -> { data, fetchedAt }
+
+// Caché persistente del catálogo de estatus (cambia muy poco).
+const STATUS_CATALOG_KEY = "statusCatalog:CS000001:v1";
+const STATUS_CATALOG_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+
+// Texto corto "hace X min" para el banner de estado.
+const formatAgo = (ts) => {
+  const min = Math.round((Date.now() - ts) / 60000);
+  if (min < 1) return "hace un momento";
+  if (min < 60) return `hace ${min} min`;
+  return `hace ${Math.round(min / 60)} h`;
+};
+// FMS NUEVO - FIN
+
+// FMS ELIMINADO - INICIO
+// function buildCheckinBulkPayload({ orderId, base64 }) {
+// FMS ELIMINADO - FIN
+// FMS NUEVO - INICIO
+function buildCheckinBulkPayload({ orderId, base64, bulkId }) {
+// FMS NUEVO - FIN
   const cleanOrderId = String(orderId || "").trim();
   const cleanBase64 = String(base64 || "")
     .replace(/^data:[^;]+;base64,/, "")
@@ -71,9 +131,12 @@ function buildCheckinBulkPayload({ orderId, base64 }) {
   if (!cleanBase64) throw new Error("La fotografía del check-in está vacía.");
 
   return {
-    BulkId: buildWorkOrderBulkId({
-      firstOrderId: cleanOrderId,
-    }),
+        // FMS ELIMINADO - INICIO
+    // BulkId: buildWorkOrderBulkId({ firstOrderId: cleanOrderId }),
+    // FMS ELIMINADO - FIN
+    // FMS NUEVO - INICIO
+    BulkId: bulkId || buildWorkOrderBulkId({ firstOrderId: cleanOrderId }),
+    // FMS NUEVO - FIN
     WorkOrderSet: [
       {
         OrderId: cleanOrderId,
@@ -505,6 +568,21 @@ async function removeFromQueue(userEmail, orderId) {
   return next;
 }
 
+// FMS NUEVO - INICIO
+async function updateQueueItem(userEmail, orderId, patch) {
+  const q = await loadCheckinQueue(userEmail);
+  const next = q.map((x) =>
+    String(x?.orderId) === String(orderId) ? { ...x, ...patch } : x,
+  );
+
+  await saveCheckinQueue(userEmail, next);
+  return next;
+}
+
+// Espera entre reintentos de un envío que no obtuvo respuesta.
+const SYNC_BACKOFF_MS = [15000, 30000, 60000, 120000, 300000];
+// FMS NUEVO - FIN
+
 export default function ListaOrdenesTecnico() {
   const { user, ensureValidToken } = useAuth();
 
@@ -523,7 +601,34 @@ export default function ListaOrdenesTecnico() {
   const [loadingHistorical, setLoadingHistorical] = useState(false);
   const [ordenes, setOrdenes] = useState([]);
 
-  const refreshing = refreshingCentral || loadingHistorical;
+  // FMS NUEVO - INICIO
+  // Estado de la consulta histórica (periodos fuera de la ventana offline):
+  // - historicalError: "offline" | "request_error" | null  -> para avisar al usuario
+  // - historicalUpdatedAt: cuándo se consultó SAP por última vez ese periodo
+  // - historicalReqRef: contador para ignorar respuestas viejas (condición de carrera)
+  // - ensureValidTokenRef: evita que cambios de identidad de ensureValidToken
+  //   (AuthContext no la memoiza) vuelvan a disparar la consulta.
+  const [historicalError, setHistoricalError] = useState(null);
+  const [historicalUpdatedAt, setHistoricalUpdatedAt] = useState(null);
+  const historicalReqRef = useRef(0);
+
+  const ensureValidTokenRef = useRef(ensureValidToken);
+  useEffect(() => {
+    ensureValidTokenRef.current = ensureValidToken;
+  }, [ensureValidToken]);
+  // FMS NUEVO - FIN
+
+  // FMS ELIMINADO - INICIO
+  // Antes: el spinner del pull-to-refresh también se activaba con la consulta
+  // histórica, pero el usuario no veía ningún mensaje claro de que se estaba consultando.
+  // const refreshing = refreshingCentral || loadingHistorical;
+  // FMS ELIMINADO - FIN
+
+  // FMS NUEVO - INICIO
+  // Ahora el indicador de carga histórica es un banner visible (statusBanner)
+  // y el spinner dentro de la lista; el pull-to-refresh solo refleja la recarga central.
+  const refreshing = refreshingCentral;
+  // FMS NUEVO - FIN
 
   const [query, setQuery] = useState("");
   const [dateMode, setDateMode] = useState("day");
@@ -559,6 +664,13 @@ export default function ListaOrdenesTecnico() {
   const [isOnline, setIsOnline] = useState(true);
   const [checkinQueue, setCheckinQueue] = useState([]);
   const syncingRef = useRef(false);
+    // FMS NUEVO - INICIO
+  const syncRef = useRef(null); // siempre apunta a la última syncCheckinQueue
+  const syncRerunRef = useRef(false);
+  const syncTimerRef = useRef(null);
+
+  useEffect(() => () => clearTimeout(syncTimerRef.current), []);
+  // FMS NUEVO - FIN
 
   const pendingSet = useMemo(() => {
     const s = new Set();
@@ -666,6 +778,11 @@ export default function ListaOrdenesTecnico() {
       return data;
     }
   }, []);
+
+  // FMS ELIMINADO - INICIO
+  // Antes: cada vez que se montaba la pantalla se llamaba a SAP para traer el
+  // catálogo de estatus, y si fallaba (offline) se borraba el mapa con {}.
+  /*
   const fetchStatusCatalog = async () => {
     try {
       const res = await api.get(
@@ -691,6 +808,59 @@ export default function ListaOrdenesTecnico() {
       setStatusCatalogMap({});
     }
   };
+  */
+  // FMS ELIMINADO - FIN
+
+  // FMS NUEVO - INICIO
+  // Ahora: 1) se pinta de inmediato lo guardado en AsyncStorage,
+  //        2) solo se consulta SAP si la caché tiene más de 24 h y hay internet,
+  //        3) si falla, NO se borra el mapa que ya existía.
+  const fetchStatusCatalog = async () => {
+    try {
+      const raw = await AsyncStorage.getItem(STATUS_CATALOG_KEY);
+      const cached = raw ? JSON.parse(raw) : null;
+
+      if (cached?.map) setStatusCatalogMap(cached.map);
+
+      const cacheIsFresh =
+        cached && Date.now() - Number(cached.savedAt || 0) < STATUS_CATALOG_TTL_MS;
+
+      if (cacheIsFresh) return;
+
+      const net = await NetInfo.fetch();
+      const online = !!(net?.isConnected && net?.isInternetReachable !== false);
+
+      if (!online) return;
+
+      const res = await api.get(
+        "/api/odata/ZSD_CATALOGOS_SRV/StatusWorkOrderSet?$filter=Stsma%20eq%20%27CS000001%27&$format=json",
+      );
+
+      const results = res?.data?.d?.results || [];
+      const map = {};
+
+      results.forEach((r) => {
+        const k = normalizeCode(r?.Status1);
+        const v = String(r?.Status2 || "").trim();
+
+        if (k) map[k] = v;
+      });
+
+      setStatusCatalogMap(map);
+
+      await AsyncStorage.setItem(
+        STATUS_CATALOG_KEY,
+        JSON.stringify({ map, savedAt: Date.now() }),
+      );
+    } catch (e) {
+      // No se sobrescribe el mapa con {}: se conserva lo que ya hubiera.
+      console.log(
+        "Error catálogo estatus:",
+        e?.response?.data || e?.message || e,
+      );
+    }
+  };
+  // FMS NUEVO - FIN
 
   const refreshQueue = useCallback(async () => {
     const q = await loadCheckinQueue(userEmail);
@@ -701,7 +871,7 @@ export default function ListaOrdenesTecnico() {
     refreshQueue();
   }, [refreshQueue]);
 
-  // escuchar red
+    // escuchar red
   useEffect(() => {
     const unsub = NetInfo.addEventListener((state) => {
       const onlineNow = !!(
@@ -713,6 +883,13 @@ export default function ListaOrdenesTecnico() {
 
     return () => unsub();
   }, []);
+
+  // FMS NUEVO - INICIO
+  // Si la app se cerró antes de que SAP confirmara, se retoma al abrir la lista.
+  useEffect(() => {
+    if (userEmail) resumePendingConfirmations(userEmail);
+  }, [userEmail]);
+  // FMS NUEVO - FIN
 
 
   // Precarga en segundo plano los catálogos del aviso de avería (R, S, T)
@@ -763,6 +940,11 @@ export default function ListaOrdenesTecnico() {
 
   // Consulta temporal para periodos fuera de la ventana offline.
   // Los resultados se guardan solo en el estado de esta pantalla.
+
+  // FMS ELIMINADO - INICIO
+  // Antes: sin caché en memoria, sin aviso de error/offline, sin protección contra
+  // respuestas viejas, y se vaciaba la lista (setHistoricalOrdenes([])) en cada fallo.
+  /*
   const fetchHistoricalOrdenes = useCallback(async () => {
     if (selectedRangeIsCached) {
       setHistoricalOrdenes([]);
@@ -831,6 +1013,148 @@ export default function ListaOrdenesTecnico() {
     start,
     end,
   ]);
+  */
+  // FMS ELIMINADO - FIN
+
+  // FMS NUEVO - INICIO
+  // Ahora:
+  //  1) Si el periodo ya se consultó antes, se muestra al instante desde memoria.
+  //  2) Si esa consulta es reciente (< HISTORICAL_TTL_MS) y no es recarga manual,
+  //     NO se vuelve a llamar a SAP.
+  //  3) Si hay que consultar, se conserva lo que ya se mostraba y se avisa
+  //     "Actualizando desde SAP…" en lugar de vaciar la lista.
+  //  4) Offline o error: se informa con historicalError y NO se borra la lista.
+  //  5) historicalReqRef descarta respuestas de periodos que ya no están seleccionados.
+  const fetchHistoricalOrdenes = useCallback(
+    async ({ force = false } = {}) => {
+      // Dentro de la ventana offline no hay nada que consultar a SAP.
+      if (selectedRangeIsCached) {
+        historicalReqRef.current += 1; // invalida respuestas en vuelo
+        setHistoricalOrdenes((prev) => (prev.length ? [] : prev));
+        setHistoricalError(null);
+        setHistoricalUpdatedAt(null);
+        setLoadingHistorical(false);
+        return { ok: true, source: "cache_window", data: [] };
+      }
+
+      const reqId = ++historicalReqRef.current;
+      const isCurrent = () => reqId === historicalReqRef.current;
+      const cacheKey = `${userEmail || "anon"}|${selectedRangeKey}`;
+
+      // 1) Pintar al instante lo que ya se consultó antes.
+      const hit = historicalMemoryCache.get(cacheKey);
+
+      if (hit) {
+        setHistoricalOrdenes(hit.data);
+        setHistoricalUpdatedAt(hit.fetchedAt);
+
+        const fresh = Date.now() - hit.fetchedAt < HISTORICAL_TTL_MS;
+
+        if (fresh && !force) {
+          setHistoricalError(null);
+          setLoadingHistorical(false);
+          return { ok: true, source: "memory", data: hit.data };
+        }
+      } else {
+        setHistoricalOrdenes((prev) => (prev.length ? [] : prev));
+        setHistoricalUpdatedAt(null);
+      }
+
+      // 2) Refrescar desde SAP.
+      try {
+        setLoadingHistorical(true);
+        setHistoricalError(null);
+
+        const net = await NetInfo.fetch();
+        const online = !!(
+          net?.isConnected && net?.isInternetReachable !== false
+        );
+        setIsOnline(online);
+
+        if (!online) {
+          // Se conserva lo que ya se mostraba; solo se avisa.
+          if (isCurrent()) setHistoricalError("offline");
+          return { ok: false, reason: "offline", data: hit?.data || [] };
+        }
+
+        const okToken = await ensureValidTokenRef.current();
+
+        if (!okToken) {
+          if (isCurrent()) setHistoricalError("request_error");
+          return { ok: false, reason: "invalid_token", data: [] };
+        }
+
+        const params = new URLSearchParams({
+          start: formatLocalYmd(start),
+          end: formatLocalYmd(end),
+          mode: "range",
+        });
+
+        console.log("[ORDENES][HISTORICO] Consulta temporal:", {
+          start: formatLocalYmd(start),
+          end: formatLocalYmd(end),
+          force,
+        });
+
+        const res = await api.get(
+          `/api/ordenes/sap/list?${params.toString()}`,
+        );
+        const remote = Array.isArray(res?.data) ? res.data : [];
+        // FMS ELIMINADO - INICIO
+        // const patchedRemote = await applyTbmkyOfflineStatuses(remote);
+        // FMS ELIMINADO - FIN
+
+        // FMS NUEVO - INICIO
+        // Además del estatus TBM/KY offline, se respetan los parches locales
+        // vigentes (SAP aún no procesa el check-in enviado).
+        const patchedRemote = await overlayRecentStatusPatches(
+          userEmail,
+          await applyTbmkyOfflineStatuses(remote),
+        );
+        // FMS NUEVO - FIN
+        historicalMemoryCache.set(cacheKey, {
+          data: patchedRemote,
+          fetchedAt: Date.now(),
+        });
+
+        // Si el usuario ya cambió de periodo, se guarda en caché pero no se pinta.
+        if (!isCurrent()) {
+          return { ok: true, source: "stale_ignored", data: patchedRemote };
+        }
+
+        setHistoricalOrdenes(patchedRemote);
+        setHistoricalUpdatedAt(Date.now());
+
+        return {
+          ok: true,
+          source: "remote_temporary",
+          data: patchedRemote,
+        };
+      } catch (error) {
+        console.log(
+          "[ORDENES][HISTORICO] Error:",
+          error?.response?.data || error?.message || error,
+        );
+
+        // No se borra lo que ya se mostraba.
+        if (isCurrent()) setHistoricalError("request_error");
+
+        return { ok: false, reason: "request_error", error, data: [] };
+      } finally {
+        // Solo la consulta vigente apaga el indicador de carga.
+        if (isCurrent()) setLoadingHistorical(false);
+      }
+    },
+    [
+      applyTbmkyOfflineStatuses,
+      selectedRangeIsCached,
+      selectedRangeKey,
+      start,
+      end,
+      userEmail,
+    ],
+  );
+  // FMS NUEVO - FIN
 
   // Relee únicamente AsyncStorage. No consulta SAP.
   const reloadOrdenesFromLocal = useCallback(async () => {
@@ -856,7 +1180,14 @@ export default function ListaOrdenesTecnico() {
     // Fuera de la ventana offline se actualiza únicamente el periodo
     // seleccionado y no se escribe nada en AsyncStorage.
     if (!selectedRangeIsCached) {
-      return fetchHistoricalOrdenes();
+      // FMS ELIMINADO - INICIO
+      // return fetchHistoricalOrdenes();
+      // FMS ELIMINADO - FIN
+
+      // FMS NUEVO - INICIO
+      // La recarga manual ignora la caché en memoria (force: true).
+      return fetchHistoricalOrdenes({ force: true });
+      // FMS NUEVO - FIN
     }
 
     try {
@@ -906,6 +1237,11 @@ export default function ListaOrdenesTecnico() {
   }, [applySharedOrdenes, ordenesCompartidas]);
 
   // Al seleccionar un periodo fuera de caché, lo consulta temporalmente.
+
+  // FMS ELIMINADO - INICIO
+  // Antes: consultaba en cuanto cambiaba cualquier dependencia, incluso con la
+  // semana incompleta (solo fecha inicio) y con la identidad de ensureValidToken.
+  /*
   useEffect(() => {
     if (selectedRangeIsCached) {
       setHistoricalOrdenes([]);
@@ -918,6 +1254,18 @@ export default function ListaOrdenesTecnico() {
     selectedRangeIsCached,
     selectedRangeKey,
   ]);
+  */
+  // FMS ELIMINADO - FIN
+
+  // FMS NUEVO - INICIO
+  // Ahora: en modo Semana no consulta hasta que existan inicio Y fin.
+  // El caso "dentro de la ventana offline" lo resuelve fetchHistoricalOrdenes.
+  useEffect(() => {
+    if (dateMode === "weekRange" && (!weekStart || !weekEnd)) return;
+
+    fetchHistoricalOrdenes();
+  }, [fetchHistoricalOrdenes, dateMode, weekStart, weekEnd]);
+  // FMS NUEVO - FIN
 
   // Al volver desde el detalle, relee cambios locales sin consultar SAP.
   useFocusEffect(
@@ -990,8 +1338,12 @@ export default function ListaOrdenesTecnico() {
   };
 
   // cámara -> archivo local
+
+
   const takeCheckinPhoto = async () => {
     try {
+      // FMS ELIMINADO - INICIO
+/*
       const perm = await ImagePicker.requestCameraPermissionsAsync();
 
       if (!perm.granted) {
@@ -1007,7 +1359,43 @@ export default function ListaOrdenesTecnico() {
         base64: false,
         allowsEditing: false,
       });
+*/
+// FMS ELIMINADO - FIN
 
+// FMS NUEVO - INICIO
+      // Solo en desarrollo y en simulador (que no tiene cámara) se usa la galería.
+      // En dispositivo real y en builds de TestFlight/producción sigue la cámara.
+      const useLibraryFallback = __DEV__ && !Device.isDevice;
+
+      let result;
+
+      if (useLibraryFallback) {
+        console.log("[CHECKIN] Simulador: usando galería en lugar de cámara");
+
+        result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ["images"],
+          quality: 0.7,
+          base64: false,
+          allowsEditing: false,
+        });
+      } else {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+
+        if (!perm.granted) {
+          Alert.alert(
+            "Permiso requerido",
+            "Necesitamos permiso de cámara para tomar la evidencia.",
+          );
+          return;
+        }
+
+        result = await ImagePicker.launchCameraAsync({
+          quality: 0.7,
+          base64: false,
+          allowsEditing: false,
+        });
+      }
+// FMS NUEVO - FINr
       if (result.canceled) return;
 
       const asset = result.assets?.[0];
@@ -1055,11 +1443,76 @@ export default function ListaOrdenesTecnico() {
     }
   };
 
+  // const postCheckinBulk = async (orderId, base64) => {
+  //   const bulkPayload = buildCheckinBulkPayload({
+  //     orderId,
+  //     base64,
+  //   });
+
+  //   console.log(
+  //     "[CHECKIN][BULK][URL]",
+  //     WORK_ORDER_BULK_ENDPOINT,
+  //   );
+
+  //   logBulkPayload(
+  //     "[CHECKIN][BULK][PAYLOAD FINAL]",
+  //     bulkPayload,
+  //   );
+
+  //   try {
+  //     const response = await api.post(
+  //       WORK_ORDER_BULK_ENDPOINT,
+  //       bulkPayload,
+  //       {
+  //         timeout: 300000,
+  //         headers: {
+  //           "Content-Type": "application/json",
+  //         },
+  //       },
+  //     );
+
+  //     console.log(
+  //       "[CHECKIN][BULK][RESPUESTA SAP]",
+  //       JSON.stringify(response?.data, null, 2),
+  //     );
+
+  //     return response;
+  //   } catch (error) {
+  //     console.log(
+  //       "[CHECKIN][BULK][ERROR]",
+  //       JSON.stringify(
+  //         error?.response?.data || {
+  //           message: error?.message,
+  //           code: error?.code,
+  //         },
+  //         null,
+  //         2,
+  //       ),
+  //     );
+
+  //     throw error;
+  //   }
+  // };
+
+  // FMS NUEVO - INICIO
+// Cuando cambia el estatus de una orden (check-in), también se actualiza la
+// consulta histórica: estado en pantalla y caché en memoria.
+
   const postCheckinBulk = async (orderId, base64) => {
-    const bulkPayload = buildCheckinBulkPayload({
+    // FMS NUEVO - INICIO
+    // Un reintento de este mismo check-in lleva el MISMO BulkId.
+    const { bulkId, reused } = await getOrCreateBulkId({
       orderId,
-      base64,
+      kind: "CHECKIN",
     });
+    console.log("[CHECKIN][BULK] BulkId:", { bulkId, reutilizado: reused });
+    // FMS NUEVO - FIN
+    // FMS ELIMINADO - INICIO
+    // const bulkPayload = buildCheckinBulkPayload({ orderId, base64 });
+    // FMS ELIMINADO - FIN
+    // FMS NUEVO - INICIO
+    const bulkPayload = buildCheckinBulkPayload({ orderId, base64, bulkId });
+    // FMS NUEVO - FIN
 
     console.log(
       "[CHECKIN][BULK][URL]",
@@ -1071,23 +1524,70 @@ export default function ListaOrdenesTecnico() {
       bulkPayload,
     );
 
+    // FMS NUEVO - INICIO
+    // El tiempo de espera depende del tamaño del envío: se asume una subida
+    // mínima de ~20 KB/s más 20 s de margen, con tope de 3 minutos.
+    // Los caracteres del base64 equivalen a los bytes que viajan.
+    const payloadBytes = String(base64 || "").length + 2000;
+    const sendTimeoutMs = Math.min(
+      180000,
+      20000 + Math.ceil(payloadBytes / 20),
+    );
+
+       //const sendTimeoutMs = 1; // SOLO PARA LA PRUEBA
+
+    console.log("[CHECKIN][BULK] tamaño y timeout:", {
+      payloadBytes,
+      sendTimeoutMs,
+    });
+    // FMS NUEVO - FIN
+
     try {
+      // FMS NUEVO - INICIO
+      const t0 = Date.now();
+      // FMS NUEVO - FIN
       const response = await api.post(
         WORK_ORDER_BULK_ENDPOINT,
         bulkPayload,
         {
-          timeout: 300000,
+          // FMS ELIMINADO - INICIO
+          // timeout: 300000,
+          // FMS ELIMINADO - FIN
+
+          // FMS NUEVO - INICIO
+          timeout: sendTimeoutMs,
+          // FMS NUEVO - FIN
           headers: {
             "Content-Type": "application/json",
           },
         },
       );
 
-      console.log(
-        "[CHECKIN][BULK][RESPUESTA SAP]",
-        JSON.stringify(response?.data, null, 2),
-      );
+      // FMS ELIMINADO - INICIO
+      // console.log(
+      //   "[CHECKIN][BULK][RESPUESTA SAP]",
+      //   JSON.stringify(response?.data, null, 2),
+      // );
+      // FMS ELIMINADO - FIN
 
+      // FMS NUEVO - INICIO
+      // Resumen: ya no se imprime la respuesta completa.
+      console.log("[CHECKIN][BULK][RESPUESTA SAP]", {
+        http: response?.status,
+        ms: Date.now() - t0,
+        bytesAprox: JSON.stringify(response?.data || {}).length,
+        mensajes: (response?.data?.d?.WorkOrderSet?.results || []).flatMap(
+          (o) =>
+            (o?.Return?.results || []).map(
+              (r) => `${r?.Type}: ${r?.Message}`,
+            ),
+        ),
+      });
+      // FMS NUEVO - FIN
+
+                  // FMS NUEVO - INICIO
+      await clearBulkId({ orderId, kind: "CHECKIN" });
+      // FMS NUEVO - FIN
       return response;
     } catch (error) {
       console.log(
@@ -1102,9 +1602,43 @@ export default function ListaOrdenesTecnico() {
         ),
       );
 
+      // FMS NUEVO - INICIO
+      // Sin respuesta (timeout, red caída) NO se borra: el reintento reutiliza el
+      // identificador. Solo un rechazo explícito de SAP lo libera.
+      const httpStatus = Number(error?.response?.status || 0);
+      const rejected =
+        httpStatus >= 400 && httpStatus < 500 && httpStatus !== 408 && httpStatus !== 429;
+      if (rejected) await clearBulkId({ orderId, kind: "CHECKIN" });
+      // FMS NUEVO - FIN
+
       throw error;
     }
   };
+
+const patchHistoricalStatus = (orderId, statusCode) => {
+  const patchItem = (x) =>
+    String(x?.Orderid) === String(orderId)
+      ? {
+          ...x,
+          estatus_code: statusCode,
+          userstatus: statusCode,
+          UserStatus: statusCode,
+          UserStText: statusCode,
+          estatus_label: STATUS_META[statusCode]?.label || statusCode,
+        }
+      : x;
+
+  setHistoricalOrdenes((prev) => (prev || []).map(patchItem));
+
+  historicalMemoryCache.forEach((entry, key) => {
+    historicalMemoryCache.set(key, {
+      ...entry,
+      data: (entry.data || []).map(patchItem),
+    });
+  });
+};
+// FMS NUEVO - FIN
+
 
   const applyLocalOfflineStatus = async (orderId, statusCode = "0100") => {
     const finalStatus = normalizeCode(statusCode) || "0100";
@@ -1127,7 +1661,12 @@ export default function ListaOrdenesTecnico() {
               }
             : x,
         ),
+        
       );
+
+      // FMS NUEVO - INICIO
+      patchHistoricalStatus(orderId, finalStatus);
+      // FMS NUEVO - FIN
 
       console.log("[CHECKIN][STATUS][LOCAL]", {
         orderId,
@@ -1139,80 +1678,255 @@ export default function ListaOrdenesTecnico() {
   };
 
   // Sync cola a SAP (foto + estatus)
-  const syncCheckinQueue = useCallback(async () => {
-    if (!userEmail) return;
-    if (syncingRef.current) return;
+  // const syncCheckinQueue = useCallback(async () => {
+  //   if (!userEmail) return;
+  //   if (syncingRef.current) return;
 
-    const net = await NetInfo.fetch();
+  //   const net = await NetInfo.fetch();
 
-    const online = !!(net?.isConnected && net?.isInternetReachable !== false);
+  //   const online = !!(net?.isConnected && net?.isInternetReachable !== false);
 
-    setIsOnline(online);
+  //   setIsOnline(online);
 
-    if (!online) return;
+  //   if (!online) return;
 
-    syncingRef.current = true;
+  //   syncingRef.current = true;
 
-    try {
-      const q = await loadCheckinQueue(userEmail);
-      if (!q.length) return;
+  //   try {
+  //     const q = await loadCheckinQueue(userEmail);
+  //     if (!q.length) return;
 
-      const ok = await ensureValidToken();
-      if (!ok) return;
+  //     const ok = await ensureValidToken();
+  //     if (!ok) return;
 
-      const ordered = [...q].sort(
-        (a, b) => (a?.createdAt || 0) - (b?.createdAt || 0),
-      );
+  //     const ordered = [...q].sort(
+  //       (a, b) => (a?.createdAt || 0) - (b?.createdAt || 0),
+  //     );
 
-      for (const item of ordered) {
-        const orderId = String(item?.orderId || "").trim();
-        const photoUri = String(item?.photoUri || "").trim();
+  //     for (const item of ordered) {
+  //       const orderId = String(item?.orderId || "").trim();
+  //       const photoUri = String(item?.photoUri || "").trim();
 
-        if (!orderId || !photoUri) {
-          await removeFromQueue(userEmail, orderId);
-          continue;
-        }
+  //       if (!orderId || !photoUri) {
+  //         await removeFromQueue(userEmail, orderId);
+  //         continue;
+  //       }
 
-        try {
-          const b64 = await FileSystem.readAsStringAsync(photoUri, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
+  //       try {
+  //         const b64 = await FileSystem.readAsStringAsync(photoUri, {
+  //           encoding: FileSystem.EncodingType.Base64,
+  //         });
 
-          console.log("[CHECKIN][SYNC] Enviando:", {
-            orderId,
-            photoUri,
-            b64len: b64.length,
-          });
+  //         console.log("[CHECKIN][SYNC] Enviando:", {
+  //           orderId,
+  //           photoUri,
+  //           b64len: b64.length,
+  //         });
 
-          await postCheckinBulk(orderId, b64);
-          await removeFromQueue(userEmail, orderId);
+  //         await postCheckinBulk(orderId, b64);
+  //         // FMS NUEVO - INICIO
+  //         await markLocalStatusPatchSent(userEmail, orderId);
+  //         // FMS NUEVO - INICIO
+  //         scheduleStatusConfirmation({ userEmail, orderId }); // sin await: no bloquea
+  //         // FMS NUEVO - FIN
+  //         // FMS NUEVO - FIN
+          
+  //         await removeFromQueue(userEmail, orderId);
 
-          await FileSystem.deleteAsync(photoUri, { idempotent: true });
-        } catch (e) {
-          console.log(
-            "[CHECKIN][SYNC] Error SAP:",
-            orderId,
-            e?.response?.data || e?.message || e,
-          );
-          break;
-        }
+  //         await FileSystem.deleteAsync(photoUri, { idempotent: true });
+  //       } catch (e) {
+  //         console.log(
+  //           "[CHECKIN][SYNC] Error SAP:",
+  //           orderId,
+  //           e?.response?.data || e?.message || e,
+  //         );
+  //         break;
+  //       }
+  //     }
+
+  //     const q2 = await loadCheckinQueue(userEmail);
+  //     setCheckinQueue(q2);
+
+  //     await refreshOrdenes();
+  //   } finally {
+  //     syncingRef.current = false;
+  //   }
+  // }, [ensureValidToken, refreshOrdenes, userEmail]);
+
+    // Sync cola a SAP (foto + estatus)
+  const syncCheckinQueue = useCallback(
+    async ({ force = false } = {}) => {
+      if (!userEmail) return;
+
+      // Si ya hay un envío en curso, se vuelve a correr al terminar.
+      if (syncingRef.current) {
+        syncRerunRef.current = true;
+        return;
       }
 
-      const q2 = await loadCheckinQueue(userEmail);
-      setCheckinQueue(q2);
+      // El guardia se cierra ANTES de cualquier await; si no, varias llamadas
+      // simultáneas lo pasan y envían el mismo check-in varias veces.
+      syncingRef.current = true;
 
-      await refreshOrdenes();
-    } finally {
-      syncingRef.current = false;
-    }
-  }, [ensureValidToken, refreshOrdenes, userEmail]);
+      const net = await NetInfo.fetch();
+      const online = !!(net?.isConnected && net?.isInternetReachable !== false);
+
+      setIsOnline(online);
+      if (!online) {
+        syncingRef.current = false;
+        return;
+      }
+
+      let sentCount = 0;
+
+      try {
+        const q = await loadCheckinQueue(userEmail);
+        if (!q.length) return;
+
+        const ok = await ensureValidToken();
+        if (!ok) return;
+
+        const ordered = [...q].sort(
+          (a, b) => (a?.createdAt || 0) - (b?.createdAt || 0),
+        );
+
+        for (const item of ordered) {
+          const orderId = String(item?.orderId || "").trim();
+          const photoUri = String(item?.photoUri || "").trim();
+
+          if (!orderId || !photoUri) {
+            await removeFromQueue(userEmail, orderId);
+            continue;
+          }
+
+          // Respeta la espera entre reintentos (salvo "Sincronizar pendientes").
+          if (!force && Number(item?.nextAttemptAt || 0) > Date.now()) continue;
+
+          try {
+            const b64 = await FileSystem.readAsStringAsync(photoUri, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+
+            console.log("[CHECKIN][SYNC] Enviando:", {
+              orderId,
+              intento: Number(item?.attempts || 0) + 1,
+              b64len: b64.length,
+            });
+
+            await postCheckinBulk(orderId, b64);
+
+            await markLocalStatusPatchSent(userEmail, orderId);
+            scheduleStatusConfirmation({ userEmail, orderId }); // sin await
+
+            await removeFromQueue(userEmail, orderId);
+            await FileSystem.deleteAsync(photoUri, { idempotent: true });
+            sentCount += 1;
+          } catch (e) {
+            const attempts = Number(item?.attempts || 0) + 1;
+            const wait =
+              SYNC_BACKOFF_MS[Math.min(attempts - 1, SYNC_BACKOFF_MS.length - 1)];
+
+            await updateQueueItem(userEmail, orderId, {
+              attempts,
+              nextAttemptAt: Date.now() + wait,
+              lastError: String(e?.message || e).slice(0, 120),
+            });
+
+            console.log("[CHECKIN][SYNC] Sin éxito; se reintenta:", {
+              orderId,
+              attempts,
+              enSeg: Math.round(wait / 1000),
+              error: e?.response?.data || e?.message || e,
+            });
+          }
+        }
+
+        const q2 = await loadCheckinQueue(userEmail);
+        setCheckinQueue(q2);
+
+        // Si queda algo en la cola, se reprograma el siguiente intento.
+        clearTimeout(syncTimerRef.current);
+        if (q2.length) {
+          const nextAt = Math.min(
+            ...q2.map((x) => Number(x?.nextAttemptAt || 0) || Date.now()),
+          );
+          const delay = Math.max(2000, nextAt - Date.now());
+
+          syncTimerRef.current = setTimeout(() => {
+            Promise.resolve(syncRef.current?.()).catch(() => {});
+          }, delay);
+        }
+
+        // Solo se actualiza la lista si algo se envió.
+        if (sentCount > 0) await refreshOrdenes();
+      } finally {
+        syncingRef.current = false;
+
+        if (syncRerunRef.current) {
+          syncRerunRef.current = false;
+          Promise.resolve(syncRef.current?.()).catch(() => {});
+        }
+      }
+    },
+    [ensureValidToken, refreshOrdenes, userEmail],
+  );
+
+  // FMS NUEVO - INICIO
+  syncRef.current = syncCheckinQueue;
+  // FMS NUEVO - FIN
 
   // Auto-sync cuando regresa internet y hay cola
+  // useEffect(() => {
+  //   if (isOnline && checkinQueue.length > 0) {
+  //     syncCheckinQueue().catch(() => {});
+  //   }
+  // }, [isOnline, checkinQueue.length, syncCheckinQueue]);
+
+    // FMS ELIMINADO - INICIO
+  // useEffect(() => {
+  //   if (isOnline && checkinQueue.length > 0) {
+  //     syncCheckinQueue().catch(() => {});
+  //   }
+  // }, [isOnline, checkinQueue.length, syncCheckinQueue]);
+  // FMS ELIMINADO - FIN
+
+  // FMS NUEVO - INICIO
+  // Ya no depende de syncCheckinQueue: evita reintentos en cadena.
   useEffect(() => {
     if (isOnline && checkinQueue.length > 0) {
-      syncCheckinQueue().catch(() => {});
+      Promise.resolve(syncRef.current?.()).catch(() => {});
     }
-  }, [isOnline, checkinQueue.length, syncCheckinQueue]);
+  }, [isOnline, checkinQueue.length]);
+  // FMS NUEVO - FIN
+
+
+    // FMS NUEVO - INICIO
+  useEffect(() => {
+    return subscribeBootstrapSync((event) => {
+      if (event?.ok) reloadOrdenesFromLocal();
+    });
+  }, [reloadOrdenesFromLocal]);
+  // FMS NUEVO - FIN
+
+      // FMS NUEVO - INICIO
+  // SOLO DESARROLLO: resumen de lo guardado para trabajar sin red.
+  useEffect(() => {
+    if (!__DEV__) return undefined;
+
+    const timer = setTimeout(() => {
+      debugOfflineStorage({
+        userEmail,
+        memory: Array.from(historicalMemoryCache.entries()).map(([key, v]) => ({
+          periodo: key,
+          ordenes: v?.data?.length || 0,
+          haceMin: Math.round((Date.now() - v.fetchedAt) / 60000),
+        })),
+      });
+    }, 4000);
+
+    return () => clearTimeout(timer);
+  }, [selectedRangeKey, userEmail]);
+  // FMS NUEVO - FIN
 
   const continuarAlDetalleDespuesCheckin = async (orderId) => {
     const id = String(orderId || "").trim();
@@ -1235,7 +1949,126 @@ export default function ListaOrdenesTecnico() {
     await irADetalles(id);
   };
 
-  const enviarCheckinCompletoASap = async () => {
+  // const enviarCheckinCompletoASap = async () => {
+  //   if (!checkinOrderId) {
+  //     Alert.alert("Error", "No hay orden seleccionada.");
+  //     return;
+  //   }
+
+  //   if (!checkinPhotoUri) {
+  //     Alert.alert("Falta evidencia", "Primero toma una foto.");
+  //     return;
+  //   }
+
+  //   const orderId = String(checkinOrderId).trim();
+
+  //   try {
+  //     setIsSending(true);
+
+  //     const net = await NetInfo.fetch();
+  //     const online = !!(net?.isConnected && net?.isInternetReachable !== false);
+
+  //     setIsOnline(online);
+
+  //     if (!online) {
+  //       const offlineStatus = "0100";
+
+  //       await applyLocalOfflineStatus(orderId, offlineStatus);
+
+  //       const nextQueue = await enqueueCheckin(userEmail, {
+  //         orderId,
+  //         photoUri: checkinPhotoUri,
+  //         statusCode: offlineStatus,
+  //         lastValidStatus: offlineStatus,
+  //         createdAt: Date.now(),
+  //       });
+
+  //       setCheckinQueue(nextQueue);
+
+  //       Alert.alert(
+  //         "Check-in offline",
+  //         "Sin internet. Se guardó el check-in en cola y se enviará automáticamente cuando regrese la conexión ✅",
+  //       );
+
+  //       await continuarAlDetalleDespuesCheckin(orderId);
+
+  //       return;
+  //     }
+
+  //     const ok = await ensureValidToken();
+  //     if (!ok) return;
+
+  //     const onlineStatus = "0100";
+
+  //     const base64Data = await FileSystem.readAsStringAsync(checkinPhotoUri, {
+  //       encoding: FileSystem.EncodingType.Base64,
+  //     });
+
+  //     await postCheckinBulk(orderId, base64Data);
+  //     await applyLocalOfflineStatus(orderId, onlineStatus);
+
+  //     // FMS NUEVO - INICIO
+  //     await markLocalStatusPatchSent(userEmail, orderId);
+  //     // FMS NUEVO - INICIO
+  //         scheduleStatusConfirmation({ userEmail, orderId }); // sin await: no bloquea
+  //         // FMS NUEVO - FIN
+  //     // FMS NUEVO - FIN
+
+  //     await FileSystem.deleteAsync(checkinPhotoUri, { idempotent: true });
+
+  //     Alert.alert(
+  //       "Check-in",
+  //       "Evidencia enviada y estatus actualizado a PENDIENTE",
+  //     );
+
+  //     await continuarAlDetalleDespuesCheckin(orderId);
+  //   } catch (e) {
+  //     console.log(
+  //       "enviarCheckinCompletoASap ERROR:",
+  //       e?.response?.data || e?.message || e,
+  //     );
+
+  //     const net2 = await NetInfo.fetch();
+
+  //     const online2 = !!(
+  //       net2?.isConnected && net2?.isInternetReachable !== false
+  //     );
+
+  //     if (!online2) {
+  //       const offlineStatus = "0100";
+
+  //       await applyLocalOfflineStatus(orderId, offlineStatus);
+
+  //       const nextQueue = await enqueueCheckin(userEmail, {
+  //         orderId,
+  //         photoUri: checkinPhotoUri,
+  //         statusCode: offlineStatus,
+  //         lastValidStatus: offlineStatus,
+  //         createdAt: Date.now(),
+  //       });
+
+  //       setCheckinQueue(nextQueue);
+
+  //       Alert.alert(
+  //         "Check-in guardado",
+  //         "Se cayó la conexión. Se guardó en cola y se enviará cuando regrese internet ✅",
+  //       );
+
+  //       await continuarAlDetalleDespuesCheckin(orderId);
+
+  //       return;
+  //     }
+
+  //     Alert.alert(
+  //       "Error SAP",
+  //       "No se pudo completar el check-in (foto/estatus). Revisa logs.",
+  //     );
+  //   } finally {
+  //     setIsSending(false);
+  //   }
+  // };
+
+    const enviarCheckinCompletoASap = async () => {
     if (!checkinOrderId) {
       Alert.alert("Error", "No hay orden seleccionada.");
       return;
@@ -1247,105 +2080,53 @@ export default function ListaOrdenesTecnico() {
     }
 
     const orderId = String(checkinOrderId).trim();
+    const checkinStatus = "0100";
 
     try {
       setIsSending(true);
 
-      const net = await NetInfo.fetch();
-      const online = !!(net?.isConnected && net?.isInternetReachable !== false);
+      // FMS NUEVO - INICIO
+      // 1) PRIMERO se guarda todo en el teléfono: estatus local, foto y cola.
+      await applyLocalOfflineStatus(orderId, checkinStatus);
 
-      setIsOnline(online);
-
-      if (!online) {
-        const offlineStatus = "0100";
-
-        await applyLocalOfflineStatus(orderId, offlineStatus);
-
-        const nextQueue = await enqueueCheckin(userEmail, {
-          orderId,
-          photoUri: checkinPhotoUri,
-          statusCode: offlineStatus,
-          lastValidStatus: offlineStatus,
-          createdAt: Date.now(),
-        });
-
-        setCheckinQueue(nextQueue);
-
-        Alert.alert(
-          "Check-in offline",
-          "Sin internet. Se guardó el check-in en cola y se enviará automáticamente cuando regrese la conexión ✅",
-        );
-
-        await continuarAlDetalleDespuesCheckin(orderId);
-
-        return;
-      }
-
-      const ok = await ensureValidToken();
-      if (!ok) return;
-
-      const onlineStatus = "0100";
-
-      const base64Data = await FileSystem.readAsStringAsync(checkinPhotoUri, {
-        encoding: FileSystem.EncodingType.Base64,
+      const nextQueue = await enqueueCheckin(userEmail, {
+        orderId,
+        photoUri: checkinPhotoUri,
+        statusCode: checkinStatus,
+        lastValidStatus: checkinStatus,
+        createdAt: Date.now(),
+        attempts: 0,
+        nextAttemptAt: 0,
       });
 
-      await postCheckinBulk(orderId, base64Data);
-      await applyLocalOfflineStatus(orderId, onlineStatus);
+      setCheckinQueue(nextQueue);
 
-      await FileSystem.deleteAsync(checkinPhotoUri, { idempotent: true });
+      // 2) El envío arranca en segundo plano y NO se espera.
+      Promise.resolve(syncRef.current?.({ force: true })).catch(() => {});
 
+      // 3) La pantalla avanza de inmediato.
       Alert.alert(
-        "Check-in",
-        "Evidencia enviada y estatus actualizado a PENDIENTE",
+        "Check-in guardado",
+        "Se envía a SAP en segundo plano. Si no hay buena señal, se reintentará solo.",
       );
 
       await continuarAlDetalleDespuesCheckin(orderId);
+      // FMS NUEVO - FIN
     } catch (e) {
       console.log(
         "enviarCheckinCompletoASap ERROR:",
         e?.response?.data || e?.message || e,
       );
 
-      const net2 = await NetInfo.fetch();
-
-      const online2 = !!(
-        net2?.isConnected && net2?.isInternetReachable !== false
-      );
-
-      if (!online2) {
-        const offlineStatus = "0100";
-
-        await applyLocalOfflineStatus(orderId, offlineStatus);
-
-        const nextQueue = await enqueueCheckin(userEmail, {
-          orderId,
-          photoUri: checkinPhotoUri,
-          statusCode: offlineStatus,
-          lastValidStatus: offlineStatus,
-          createdAt: Date.now(),
-        });
-
-        setCheckinQueue(nextQueue);
-
-        Alert.alert(
-          "Check-in guardado",
-          "Se cayó la conexión. Se guardó en cola y se enviará cuando regrese internet ✅",
-        );
-
-        await continuarAlDetalleDespuesCheckin(orderId);
-
-        return;
-      }
-
       Alert.alert(
-        "Error SAP",
-        "No se pudo completar el check-in (foto/estatus). Revisa logs.",
+        "Check-in",
+        "No se pudo guardar el check-in en el teléfono. Intenta de nuevo.",
       );
     } finally {
       setIsSending(false);
     }
   };
+
 
   const clearFilters = () => {
     setQuery("");
@@ -1508,6 +2289,61 @@ export default function ListaOrdenesTecnico() {
     return `Día: ${atStartOfDay(dayRef).toLocaleDateString()}`;
   }, [dateMode, dayRef, weekStart, weekEnd, monthYear]);
 
+  // FMS NUEVO - INICIO
+  // Mensaje de estado para el usuario cuando el periodo seleccionado está
+  // fuera de la ventana offline (se consulta a SAP). Devuelve null si no aplica.
+  const statusBanner = useMemo(() => {
+    if (selectedRangeIsCached) return null;
+
+    // Semana incompleta: todavía no se ha lanzado ninguna consulta.
+    if (dateMode === "weekRange" && (!weekStart || !weekEnd)) return null;
+
+    const hasData = historicalOrdenes.length > 0;
+
+    if (loadingHistorical) {
+      return {
+        tone: "info",
+        spinner: true,
+        text: hasData ? "Actualizando desde SAP…" : "Consultando SAP…",
+      };
+    }
+
+    if (historicalError === "offline") {
+      return {
+        tone: "warn",
+        text: hasData
+          ? "Sin conexión. Mostrando la última consulta de este periodo."
+          : "Sin conexión. Este periodo no está guardado en el dispositivo.",
+      };
+    }
+
+    if (historicalError === "request_error") {
+      return {
+        tone: "error",
+        text: "No se pudo consultar SAP. Toca Recargar para reintentar.",
+      };
+    }
+
+    if (historicalUpdatedAt) {
+      return {
+        tone: "ok",
+        text: `Consultado ${formatAgo(historicalUpdatedAt)}`,
+      };
+    }
+
+    return null;
+  }, [
+    selectedRangeIsCached,
+    dateMode,
+    weekStart,
+    weekEnd,
+    loadingHistorical,
+    historicalError,
+    historicalUpdatedAt,
+    historicalOrdenes.length,
+  ]);
+  // FMS NUEVO - FIN
+
   return (
     <View style={styles.container}>
       <Header title="Órdenes asignadas" />
@@ -1632,7 +2468,9 @@ export default function ListaOrdenesTecnico() {
             ]}
             onPress={async () => {
               await refreshQueue();
-              await syncCheckinQueue();
+              //await syncCheckinQueue();
+
+                            await syncCheckinQueue({ force: true });
             }}
             activeOpacity={0.85}
             disabled={checkinQueue.length === 0}
@@ -1642,6 +2480,31 @@ export default function ListaOrdenesTecnico() {
               {checkinQueue.length ? `(${checkinQueue.length})` : ""}
             </Text>
           </TouchableOpacity>
+                    {/* FMS NUEVO - INICIO */}
+          {__DEV__ && (
+            
+            <TouchableOpacity
+              style={styles.clearBtn}
+              onPress={() => {
+                
+                console.log("[OFFLINE][DIAG] Ejecutando diagnóstico manual…");
+                debugOfflineStorage({
+                  userEmail,
+                  memory: Array.from(historicalMemoryCache.entries()).map(
+                    ([key, v]) => ({
+                      periodo: key,
+                      ordenes: v?.data?.length || 0,
+                      haceMin: Math.round((Date.now() - v.fetchedAt) / 60000),
+                    }),
+                  ),
+                });
+              }}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.clearBtnText}>Diag</Text>
+            </TouchableOpacity>
+          )}
+          {/* FMS NUEVO - FIN */}
         </View>
 
         {showDayPicker && (
@@ -1722,6 +2585,23 @@ export default function ListaOrdenesTecnico() {
           </View>
         )}
       </View>
+
+      {/* FMS NUEVO - INICIO */}
+      {/* Banner de estado de la consulta a SAP (solo periodos fuera de la ventana offline) */}
+      {statusBanner && (
+        <View
+          style={[
+            styles.syncBanner,
+            styles[`syncBanner_${statusBanner.tone}`],
+          ]}
+        >
+          {statusBanner.spinner && (
+            <ActivityIndicator size="small" color={FIORI.accent} />
+          )}
+          <Text style={styles.syncBannerText}>{statusBanner.text}</Text>
+        </View>
+      )}
+      {/* FMS NUEVO - FIN */}
 
       {/* Modal Mes */}
       <Modal
@@ -1896,6 +2776,10 @@ export default function ListaOrdenesTecnico() {
           contentContainerStyle={{ padding: 12, paddingTop: 6 }}
           refreshing={refreshing}
           onRefresh={refreshOrdenes}
+          // FMS ELIMINADO - INICIO
+          // Antes: siempre mostraba "No hay órdenes…" aunque se estuviera
+          // consultando SAP o la consulta hubiera fallado.
+          /*
           ListEmptyComponent={
             <Text
               style={{
@@ -1907,10 +2791,44 @@ export default function ListaOrdenesTecnico() {
               No hay órdenes con los filtros actuales.
             </Text>
           }
+          */
+          // FMS ELIMINADO - FIN
+
+          // FMS NUEVO - INICIO
+          // Ahora distingue: cargando / sin conexión / error / realmente vacío.
+          ListEmptyComponent={
+            loadingHistorical && !selectedRangeIsCached ? (
+              <ActivityIndicator
+                style={{ marginTop: 32 }}
+                size="large"
+                color={FIORI.accent}
+              />
+            ) : (
+              <Text
+                style={{
+                  textAlign: "center",
+                  marginTop: 24,
+                  color: FIORI.textMuted,
+                }}
+              >
+                {!selectedRangeIsCached && historicalError === "offline"
+                  ? "Este periodo no está disponible sin conexión."
+                  : !selectedRangeIsCached && historicalError === "request_error"
+                    ? "No se pudieron cargar las órdenes de este periodo."
+                    : "No hay órdenes con los filtros actuales."}
+              </Text>
+            )
+          }
+          // FMS NUEVO - FIN
         />
       )}
     </View>
   );
+
+  
+
+
+
 }
 
 const styles = StyleSheet.create({
@@ -2342,5 +3260,47 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontWeight: "700",
   },
+
+  // FMS NUEVO - INICIO
+  // Estilos del banner de estado de la consulta a SAP.
+  syncBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginHorizontal: 12,
+    marginTop: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+
+  syncBanner_info: {
+    backgroundColor: FIORI.accentSoft,
+    borderColor: FIORI.accent,
+  },
+
+  syncBanner_warn: {
+    backgroundColor: "#FFF7E6",
+    borderColor: "#F5C26B",
+  },
+
+  syncBanner_error: {
+    backgroundColor: "#FDECEC",
+    borderColor: FIORI.danger,
+  },
+
+  syncBanner_ok: {
+    backgroundColor: "#F2FCF5",
+    borderColor: "#D3EEDC",
+  },
+
+  syncBannerText: {
+    color: FIORI.ink,
+    fontSize: 12,
+    fontWeight: "700",
+    flex: 1,
+  },
+  // FMS NUEVO - FIN
 
 });

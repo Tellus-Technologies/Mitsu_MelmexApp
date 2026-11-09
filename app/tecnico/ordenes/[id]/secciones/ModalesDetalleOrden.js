@@ -430,7 +430,15 @@ export default function ModalesDetalleOrden({
                   <TouchableOpacity
                     style={signStyles.openSignatureBtn}
                     activeOpacity={0.9}
-                    onPress={() => setShowSignaturePadModal(true)}
+                    // FMS ELIMINADO - INICIO
+                    // onPress={() => setShowSignaturePadModal(true)}
+                    // FMS ELIMINADO - FIN
+                    // FMS NUEVO - INICIO
+                    onPress={() => {
+                      //console.log("[FIRMA] Botón pulsado; abriendo recuadro");
+                      setShowSignaturePadModal(true);
+                    }}
+                    // FMS NUEVO - FIN
                     disabled={!!savingSignature}
                   >
                     <Ionicons name="create-outline" size={18} color="#fff" />
@@ -474,7 +482,6 @@ export default function ModalesDetalleOrden({
             </View>
           </KeyboardAvoidingView>
         </View>
-      </Modal>
 
       {/* ===== Modal secundario: solo firma ===== */}
       <Modal
@@ -617,6 +624,7 @@ export default function ModalesDetalleOrden({
             </View>
           </View>
         </View>
+      </Modal>
       </Modal>
     </>
   );

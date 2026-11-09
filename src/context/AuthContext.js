@@ -19,6 +19,7 @@ import Constants from "expo-constants";
 
 import { authGet, authSet, authDel } from "../offline/db";
 import { isOnline } from "../offline/net";
+import * as Linking from "expo-linking";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -141,6 +142,7 @@ export const AuthProvider = ({ children }) => {
 
   const refreshTimerRef = useRef(null);
   const ssoInProgressRef = useRef(false);
+  const finishingCodeRef = useRef(null);
 
   const clearRefreshTimer = () => {
     if (refreshTimerRef.current) {
@@ -827,6 +829,23 @@ export const AuthProvider = ({ children }) => {
       };
     }
 
+        if (result.url) {
+      try {
+        const { queryParams } = Linking.parse(result.url);
+
+        console.log("[SSO] Parámetros del callback:", {
+          keys: Object.keys(queryParams || {}),
+          hasCode: !!queryParams?.code,
+          error: queryParams?.error || null,
+        });
+
+        return await finishSSO(queryParams || {});
+      } catch (e) {
+        console.log("[SSO] Error procesando callback:", e?.message || e);
+        throw e;
+      }
+    }
+
     return { ok: true };
   };
 
@@ -840,6 +859,14 @@ export const AuthProvider = ({ children }) => {
     const code = params?.code;
     const error = params?.error;
     const errorDescription = params?.error_description;
+
+    if (code) {
+      if (finishingCodeRef.current === code) {
+        console.log("[SSO] Callback duplicado ignorado");
+        return { ok: true, duplicate: true };
+      }
+      finishingCodeRef.current = code;
+    }
 
     console.log("[SSO] Callback recibido:", {
       hasCode: !!code,

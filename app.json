@@ -3,7 +3,7 @@
     "name": "Melmex App QAS",
     "slug": "mitsu_frontend",
     "scheme": "mitsuapp",
-    "version": "1.0.1.5",
+    "version": "1.0.3",
     "orientation": "portrait",
     "icon": "./assets/icon_mitsu_qas.png",
     "userInterfaceStyle": "light",
@@ -17,7 +17,9 @@
       "supportsTablet": true,
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Necesitamos tu ubicación para monitoreo en tiempo real."
-      }
+      },
+      "bundleIdentifier": "com.melmex.qas",
+      "buildNumber": "5"
     },
     "android": {
       "adaptiveIcon": {
@@ -52,6 +54,12 @@
       "expo-sqlite",
       "expo-asset",
       "expo-location",
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Necesitamos la cámara para tomar la evidencia fotográfica del check-in y de los reportes."
+        }
+      ],
       "expo-splash-screen",
       "./plugins/withBtpG5Trust"
     ],

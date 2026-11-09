@@ -258,9 +258,27 @@ export function filterOrdenesByWindow(ordenes = [], start, end) {
 /**
  * Guarda lista offline (YA FILTRADA)
  */
-export async function saveOrdenesTecnicoList(userEmail, ordenes, window) {
+// FMS ELIMINADO - INICIO
+// export async function saveOrdenesTecnicoList(userEmail, ordenes, window) {
+//   const payload = {
+//     updatedAt: Date.now(),
+// FMS ELIMINADO - FIN
+
+// FMS NUEVO - INICIO
+// updatedAtOverride (opcional): conserva la fecha de la última sincronización
+// del RANGO; 0 = "nunca sincronizado".
+export async function saveOrdenesTecnicoList(
+  userEmail,
+  ordenes,
+  window,
+  updatedAtOverride,
+) {
   const payload = {
-    updatedAt: Date.now(),
+    updatedAt:
+      updatedAtOverride !== undefined
+        ? Number(updatedAtOverride) || 0
+        : Date.now(),
+// FMS NUEVO - FIN
     window: window
       ? {
           start: window.start?.toISOString?.() || null,

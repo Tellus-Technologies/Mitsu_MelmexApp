@@ -1,7 +1,19 @@
+// FMS ELIMINADO - INICIO
+// import { isOnline } from "./net";
+// import api from "../services/api";
+// import { mergeConsumiblesPair } from "./consumiblesCatalogoCache";
+// FMS ELIMINADO - FIN
+
+// FMS NUEVO - INICIO
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { isOnline } from "./net";
 import api from "../services/api";
-import { mergeConsumiblesPair } from "./consumiblesCatalogoCache";
-
+import {
+  loadConsumiblesCatalogo,
+  mergeConsumiblesBatch,
+  buildConsumiblePairKey,
+} from "./consumiblesCatalogoCache";
+// FMS NUEVO - FIN
 export const COVERAGE_PAIRS = {
   BASICA: [
     { Agr1: "BASICO", Agr2: "GRASAS" },
@@ -74,93 +86,274 @@ export const COVERAGE_PAIRS = {
   ],
 };
 
-function uniqPairsForCoverage(coverageKey) {
-  const arr = COVERAGE_PAIRS[String(coverageKey || "").toUpperCase()] || [];
-  const seen = new Set();
+// function uniqPairsForCoverage(coverageKey) {
+//   const arr = COVERAGE_PAIRS[String(coverageKey || "").toUpperCase()] || [];
+//   const seen = new Set();
 
-  return arr.filter((p) => {
-    const k = `${String(p?.Agr1 || "").trim().toUpperCase()}__${String(
-      p?.Agr2 || ""
-    )
-      .trim()
-      .toUpperCase()}`;
+//   return arr.filter((p) => {
+//     const k = `${String(p?.Agr1 || "").trim().toUpperCase()}__${String(
+//       p?.Agr2 || ""
+//     )
+//       .trim()
+//       .toUpperCase()}`;
 
-    if (!k || seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-}
+//     if (!k || seen.has(k)) return false;
+//     seen.add(k);
+//     return true;
+//   });
+// }
+
+// function extractResults(res) {
+//   return res?.data?.d?.results || res?.data?.results || [];
+// }
+
+// async function fetchMaterialesByPair(agr1, agr2) {
+//   const a1 = String(agr1 || "").trim().toUpperCase();
+//   const a2 = String(agr2 || "").trim().toUpperCase();
+
+//   const url =
+//     `/api/odata/ZSD_CATALOGOS_SRV/MaterialesCoberturaSet` +
+//     `?$filter=Agrupador1 eq '${a1}' and Agrupador2 eq '${a2}'`;
+
+//   const res = await api.get(url);
+//   return extractResults(res);
+// }
+
+// export async function bootstrapPrefetchConsumiblesCatalogo({
+//   coverages = ["BASICA", "MEDIA", "SEMI"],
+// } = {}) {
+//   const online = await isOnline();
+//   if (!online) return { ok: false, reason: "offline" };
+
+//   let ok = 0;
+//   let fail = 0;
+//   const detail = [];
+
+//   for (const coverage of coverages) {
+//     const cov = String(coverage || "").trim().toUpperCase();
+//     const pairs = uniqPairsForCoverage(cov);
+
+//     for (const pair of pairs) {
+//       const a1 = String(pair?.Agr1 || "").trim().toUpperCase();
+//       const a2 = String(pair?.Agr2 || "").trim().toUpperCase();
+
+//       try {
+//         const rows = await fetchMaterialesByPair(a1, a2);
+
+//         await mergeConsumiblesPair({
+//           coverageKey: cov,
+//           agr1: a1,
+//           agr2: a2,
+//           materials: rows,
+//         });
+
+//         ok += 1;
+//         detail.push({
+//           coverage: cov,
+//           Agr1: a1,
+//           Agr2: a2,
+//           count: Array.isArray(rows) ? rows.length : 0,
+//           ok: true,
+//         });
+//       } catch (e) {
+//         fail += 1;
+//         detail.push({
+//           coverage: cov,
+//           Agr1: a1,
+//           Agr2: a2,
+//           count: 0,
+//           ok: false,
+//           error: e?.message || String(e),
+//         });
+//       }
+//     }
+//   }
+
+//   return {
+//     ok: true,
+//     fetched: ok,
+//     failed: fail,
+//     detail,
+//   };
+// }
+
+// FMS NUEVO - INICIO
+const CATALOG_TTL_MS = 24 * 60 * 60 * 1000; // el catálogo cambia poco: 24 h
+const LAST_FULL_SYNC_KEY = "consumiblesCatalogo:lastFullSyncAt";
+const REQUEST_TIMEOUT_MS = 20000;
+const CONCURRENCY = 3;
+
+const norm = (v) => String(v ?? "").trim().toUpperCase();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function extractResults(res) {
   return res?.data?.d?.results || res?.data?.results || [];
 }
 
-async function fetchMaterialesByPair(agr1, agr2) {
-  const a1 = String(agr1 || "").trim().toUpperCase();
-  const a2 = String(agr2 || "").trim().toUpperCase();
+// Cada combinación Agr1/Agr2 se pide UNA vez y se reparte a todas las
+// coberturas que la usan (BASICO va en las 3, MEDIO en 2, SEMIFULL en 1).
+function buildUniquePairs(coverages) {
+  const map = new Map();
 
+  for (const coverage of coverages) {
+    const cov = norm(coverage);
+
+    for (const pair of COVERAGE_PAIRS[cov] || []) {
+      const a1 = norm(pair?.Agr1);
+      const a2 = norm(pair?.Agr2);
+      if (!a1 || !a2) continue;
+
+      const key = buildConsumiblePairKey(a1, a2);
+
+      if (!map.has(key)) {
+        map.set(key, { key, Agr1: a1, Agr2: a2, coverages: [] });
+      }
+
+      const entry = map.get(key);
+      if (!entry.coverages.includes(cov)) entry.coverages.push(cov);
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+async function fetchMaterialesByPair(agr1, agr2) {
   const url =
     `/api/odata/ZSD_CATALOGOS_SRV/MaterialesCoberturaSet` +
-    `?$filter=Agrupador1 eq '${a1}' and Agrupador2 eq '${a2}'`;
+    `?$filter=Agrupador1 eq '${norm(agr1)}' and Agrupador2 eq '${norm(agr2)}'`;
 
-  const res = await api.get(url);
+  const res = await api.get(url, { timeout: REQUEST_TIMEOUT_MS });
   return extractResults(res);
 }
 
-export async function bootstrapPrefetchConsumiblesCatalogo({
-  coverages = ["BASICA", "MEDIA", "SEMI"],
-} = {}) {
-  const online = await isOnline();
-  if (!online) return { ok: false, reason: "offline" };
+// Descarga con un máximo de CONCURRENCY peticiones a la vez.
+async function fetchPairs(pairs) {
+  const fetched = [];
+  const failed = [];
+  let index = 0;
 
-  let ok = 0;
-  let fail = 0;
-  const detail = [];
-
-  for (const coverage of coverages) {
-    const cov = String(coverage || "").trim().toUpperCase();
-    const pairs = uniqPairsForCoverage(cov);
-
-    for (const pair of pairs) {
-      const a1 = String(pair?.Agr1 || "").trim().toUpperCase();
-      const a2 = String(pair?.Agr2 || "").trim().toUpperCase();
+  async function worker() {
+    while (index < pairs.length) {
+      const pair = pairs[index];
+      index += 1;
 
       try {
-        const rows = await fetchMaterialesByPair(a1, a2);
-
-        await mergeConsumiblesPair({
-          coverageKey: cov,
-          agr1: a1,
-          agr2: a2,
-          materials: rows,
-        });
-
-        ok += 1;
-        detail.push({
-          coverage: cov,
-          Agr1: a1,
-          Agr2: a2,
-          count: Array.isArray(rows) ? rows.length : 0,
-          ok: true,
-        });
+        const rows = await fetchMaterialesByPair(pair.Agr1, pair.Agr2);
+        fetched.push({ ...pair, materials: Array.isArray(rows) ? rows : [] });
       } catch (e) {
-        fail += 1;
-        detail.push({
-          coverage: cov,
-          Agr1: a1,
-          Agr2: a2,
-          count: 0,
-          ok: false,
-          error: e?.message || String(e),
-        });
+        failed.push({ ...pair, error: e?.message || String(e) });
       }
     }
   }
 
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, pairs.length) }, () => worker()),
+  );
+
+  return { fetched, failed };
+}
+
+async function runPrefetch({
+  coverages = ["BASICA", "MEDIA", "SEMI"],
+  force = false,
+  delayMs = 0,
+} = {}) {
+  const t0 = Date.now();
+
+  // Deja que la lista y el detalle de hoy vayan primero.
+  if (delayMs > 0) await sleep(delayMs);
+
+  const online = await isOnline();
+  if (!online) return { ok: false, reason: "offline" };
+
+  const allPairs = buildUniquePairs(coverages);
+  const cached = await loadConsumiblesCatalogo();
+  const data = cached?.data || {};
+
+  let lastFullAt = 0;
+  try {
+    lastFullAt = Number(await AsyncStorage.getItem(LAST_FULL_SYNC_KEY)) || 0;
+  } catch {}
+
+  const stale = !lastFullAt || Date.now() - lastFullAt >= CATALOG_TTL_MS;
+
+  // Grupos que no están guardados en alguna de sus coberturas.
+  const missing = allPairs.filter(
+    (pair) => !pair.coverages.every((cov) => Array.isArray(data?.[cov]?.[pair.key])),
+  );
+
+  const pairsToFetch = force || stale ? allPairs : missing;
+
+  if (!pairsToFetch.length) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "vigente",
+      pairsTotal: allPairs.length,
+      haceHoras: Math.round((Date.now() - lastFullAt) / 3600000),
+    };
+  }
+
+  let { fetched, failed } = await fetchPairs(pairsToFetch);
+
+  // Un único reintento de lo que haya fallado.
+  if (failed.length) {
+    await sleep(1500);
+    const retry = await fetchPairs(failed);
+    fetched = fetched.concat(retry.fetched);
+    failed = retry.failed;
+  }
+
+  // UNA sola escritura. Lo que falló conserva el valor que ya había guardado.
+  if (fetched.length) {
+    await mergeConsumiblesBatch(
+      fetched.map((p) => ({
+        coverageKeys: p.coverages,
+        agr1: p.Agr1,
+        agr2: p.Agr2,
+        materials: p.materials,
+      })),
+    );
+  }
+
+  if (pairsToFetch.length === allPairs.length && fetched.length > 0) {
+    try {
+      await AsyncStorage.setItem(LAST_FULL_SYNC_KEY, String(Date.now()));
+    } catch {}
+  }
+
   return {
     ok: true,
-    fetched: ok,
-    failed: fail,
-    detail,
+    modo: force ? "forzado" : stale ? "completo" : "faltantes",
+    fetched: fetched.length,
+    failed: failed.length,
+    pairsTotal: allPairs.length,
+    ms: Date.now() - t0,
+    ...(failed.length
+      ? {
+          failedDetail: failed.map((p) => ({
+            Agr1: p.Agr1,
+            Agr2: p.Agr2,
+            error: p.error,
+          })),
+        }
+      : {}),
   };
 }
+
+// Una sola descarga a la vez, aunque varias pantallas la pidan.
+let activePromise = null;
+
+export function bootstrapPrefetchConsumiblesCatalogo(options = {}) {
+  if (activePromise) {
+    console.log("[OFFLINE][CONSUMIBLES] Ya hay una descarga en curso; se reutiliza.");
+    return activePromise;
+  }
+
+  activePromise = runPrefetch(options).finally(() => {
+    activePromise = null;
+  });
+
+  return activePromise;
+}
+// FMS NUEVO - FIN

@@ -194,7 +194,13 @@ export default function TecnicoHome() {
   useEffect(() => {
     if (!online || !dbReady) return;
 
-    bootstrapPrefetchConsumiblesCatalogo()
+    // FMS ELIMINADO - INICIO
+    // bootstrapPrefetchConsumiblesCatalogo()
+    // FMS ELIMINADO - FIN
+
+    // FMS NUEVO - INICIO
+    bootstrapPrefetchConsumiblesCatalogo({ delayMs: 6000 })
+    // FMS NUEVO - FIN
       .then((r) => {
         console.log("[OFFLINE] prefetch consumibles:", r);
       })

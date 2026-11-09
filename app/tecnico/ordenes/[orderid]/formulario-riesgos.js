@@ -57,6 +57,7 @@ import { isOnline } from "../../../../src/offline/net";
 import { upsertSapQueueItem } from "../../../../src/offline/sapQueue";
 import {
   setLocalStatusPatch,
+  markLocalStatusPatchSent,
   patchCacheOrdenesTecnicoList,
   patchCacheOrdenTecnicoDetail,
 } from "../../../../src/offline/ordenesTecnicoLocalPatch";
@@ -64,6 +65,11 @@ import {
   loadOrdenTecnicoDetail,
   saveOrdenTecnicoDetail,
 } from "../../../../src/offline/ordenesTecnicoCache";
+
+// FMS NUEVO - INICIO
+import { processSapQueue } from "../../../../src/offline/sapQueue";
+import { scheduleStatusConfirmation } from "../../../../src/offline/statusConfirmation";
+// FMS NUEVO - FIN
 
 // ===== Paleta Fiori / Horizon =====
 const FIORI = {
@@ -1959,7 +1965,16 @@ export default function FormularioRiesgosScreen() {
       // 2) OFFLINE/ONLINE
       const online = await isOnline();
 
-      if (!online) {
+      // FMS ELIMINADO - INICIO
+      // if (!online) {
+      // FMS ELIMINADO - FIN
+
+      // FMS NUEVO - INICIO
+      // Siempre se guarda primero (estatus local, borrador y cola); el envío
+      // ocurre después, en segundo plano, con o sin red.
+      const queueFirst = true;
+      if (queueFirst || !online) {
+      // FMS NUEVO - FIN
         const newStatus = "0200";
 
         await saveTbmkyJsonOffline(payload.orderid, payload);
@@ -2029,8 +2044,10 @@ export default function FormularioRiesgosScreen() {
         } catch {}
 
         Alert.alert(
-          "Guardado offline ✅",
-          "Se guardó el TBM/KY, cambió a PROCESO y se enviará cuando vuelva el internet.",
+          online ? "Guardado ✅" : "Guardado offline ✅",
+          online
+            ? "Se guardó el TBM/KY y cambió a PROCESO. Se está enviando a SAP en segundo plano."
+            : "Se guardó el TBM/KY, cambió a PROCESO y se enviará cuando vuelva el internet.",
           [
             {
               text: "Opciones de PDF",
@@ -2043,6 +2060,33 @@ export default function FormularioRiesgosScreen() {
           ],
         );
 
+               // FMS NUEVO - INICIO
+        if (online) {
+          Promise.resolve(
+            processSapQueue({ ensureValidToken, apiInstance: api }),
+          )
+            .then(async (r) => {
+              console.log("[TBMKY][QUEUE] Resultado:", {
+                ok: r?.ok,
+                processed: r?.processed,
+                remaining: r?.remaining,
+              });
+
+              // Cola vacía = nuestro paquete salió: se protege el estatus local
+              // y se verifica contra SAP en segundo plano.
+              if (r?.ok && r?.remaining === 0) {
+                await markLocalStatusPatchSent(userEmail, payload.orderid);
+                scheduleStatusConfirmation({
+                  userEmail,
+                  orderId: payload.orderid,
+                });
+              }
+            })
+            .catch((e) =>
+              console.log("[TBMKY][QUEUE] Error:", e?.message || e),
+            );
+        }
+        // FMS NUEVO - FIN
         return;
       }
 
