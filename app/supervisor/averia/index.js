@@ -33,6 +33,7 @@ const COLORS = {
   danger: "#E76565",
   warning: "#F5C044",
   success: "#6FCF97",
+  inProgressOrder: "#0A6ED1", // 🔵 Azul operativo para indicar que ya tiene orden generada en curso
 };
 
 const ymd = (d) => {
@@ -57,28 +58,63 @@ const toOdataDateTime = (d, endOfDay = false) => {
   return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}`;
 };
 
+// const sapDateToISO = (val) => {
+//   if (!val) return null;
+//   if (typeof val === "string" && val.startsWith("/Date(")) {
+//     const ms = parseInt(val.replace("/Date(", "").replace(")/", ""), 10);
+//     if (!Number.isNaN(ms)) return new Date(ms).toISOString();
+//     return null;
+//   }
+//   const d = new Date(val);
+//   return Number.isNaN(d.getTime()) ? null : d.toISOString();
+// };
+
 const sapDateToISO = (val) => {
   if (!val) return null;
   if (typeof val === "string" && val.startsWith("/Date(")) {
     const ms = parseInt(val.replace("/Date(", "").replace(")/", ""), 10);
-    if (!Number.isNaN(ms)) return new Date(ms).toISOString();
+    if (!Number.isNaN(ms)) {
+      const d = new Date(ms);
+      // Creamos la fecha usando UTC para evitar el salto de día por la zona horaria local
+      const yyyy = d.getUTCFullYear();
+      const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+      const dd = String(d.getUTCDate()).padStart(2, "0");
+      return `${yyyy}-${mm}-${dd}T00:00:00.000Z`;
+    }
     return null;
   }
   const d = new Date(val);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  if (Number.isNaN(d.getTime())) return null;
+  
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}T00:00:00.000Z`;
 };
 
+// Y aseguramos que el formateador imprima la fecha exacta sin alteraciones locales
 const formatDate = (value) => {
   if (!value) return "—";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString();
+  
+  // Extraemos directamente los valores UTC para que coincidan con lo que manda SAP
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const year = d.getUTCFullYear();
+  return `${month}/${day}/${year}`;
 };
+
+// const formatDate = (value) => {
+//   if (!value) return "—";
+//   const d = new Date(value);
+//   if (Number.isNaN(d.getTime())) return "—";
+//   return d.toLocaleDateString();
+// };
 
 // ✅ detecta “offline/network error” sin reventar LogBox con console.error
 const isNetworkError = (err) => {
   const msg = String(err?.message || "").toLowerCase();
-  // axios: cuando no hay response => red / CORS / DNS / etc
   return (
     !err?.response &&
     (msg.includes("network") ||
@@ -97,8 +133,16 @@ export default function NotificacionesAveriaSupervisor() {
 
   // filtros
   const now = new Date();
-  const [startDate, setStartDate] = useState(new Date(now.getFullYear(), 0, 1));
-  const [endDate, setEndDate] = useState(new Date(now.getFullYear(), 11, 31));
+ 
+  const primerDiaMes = new Date(now.getFullYear(), now.getMonth(), 1);
+  const ultimoDiaMes = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+
+ // const [startDate, setStartDate] = useState(new Date(now.getFullYear(), 0, 1));
+  //const [endDate, setEndDate] = useState(new Date(now.getFullYear(), 11, 31));
+  const [startDate, setStartDate] = useState(primerDiaMes);
+  const [endDate, setEndDate] = useState(ultimoDiaMes);
+  //console.log("📅 Fecha de inicio:", startDate.toLocaleDateString());
+  //console.log("📅 Fecha de fin:", endDate.toLocaleDateString());
   const [showStartPicker, setShowStartPicker] = useState(false);
   const [showEndPicker, setShowEndPicker] = useState(false);
 
@@ -157,11 +201,13 @@ export default function NotificacionesAveriaSupervisor() {
       const res = await api.get(
         `/api/odata/ZCS_GET_NOTIFICATION_SRV/NotificationHeaderSet`,
         {
-          params: { $filter: filter, $format: "json" },
-          // si tu interceptor ya mete token, esto no estorba
+          params: { $filter: filter,$format: "json" },
           headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         },
       );
+
+      // 🔍 CONSOLE.LOG PARA INSPECCIONAR LA RESPUESTA DE ODATA
+     // console.log("📥 [ODATA RESPUESTA NotificationHeaderSet]:", JSON.stringify(res?.data, null, 2));
 
       const raw = res?.data;
       const results =
@@ -190,6 +236,7 @@ export default function NotificacionesAveriaSupervisor() {
           cust_no: it?.CustNo || "",
           funct_loc: it?.MaterialLong || "",
           estatus,
+          order_id: it?.Orderid || it?.OrderId || it?.Aufnr || "",
         };
       });
 
@@ -202,15 +249,11 @@ export default function NotificacionesAveriaSupervisor() {
       setAverias(mapped);
       setCacheInfo(null);
 
-      // ✅ guardar cache
       await saveAveriasListCache({ correo, startYmd, endYmd, items: mapped });
     } catch (error) {
       const offline = isNetworkError(error);
-
-      // ✅ intenta cache
       const ok = await loadFromCache();
 
-      // ✅ Si hay cache, NO lo marques como error (para que NO salga LogBox rojo)
       if (ok) {
         if (offline) {
           console.log("[AVERIAS] Offline: usando cache");
@@ -229,7 +272,6 @@ export default function NotificacionesAveriaSupervisor() {
         return;
       }
 
-      // ❌ sin cache, ahora sí es “error real”
       console.error(
         "Error al cargar averías por OData:",
         error?.response?.data || error,
@@ -246,9 +288,7 @@ export default function NotificacionesAveriaSupervisor() {
 
   useEffect(() => {
     (async () => {
-      // ✅ primero cache rápido
       await loadFromCache();
-      // ✅ luego intenta refrescar sin bloquear (si falla y hay cache, no sale “rojo”)
       await fetchAverias({ silent: true });
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -265,6 +305,7 @@ export default function NotificacionesAveriaSupervisor() {
         item?.cust_no,
         item?.funct_loc,
         item?.estatus,
+        item?.order_id,
       ]
         .filter(Boolean)
         .join(" ")
@@ -274,15 +315,20 @@ export default function NotificacionesAveriaSupervisor() {
   }, [averias, query]);
 
   const renderItem = ({ item }) => {
-    const estatusColor =
-      item.estatus === "pendiente"
+    const tieneOrden = !!String(item.order_id || "").trim();
+
+    // 🔵 Si ya tiene orden, usamos el color azul operativo en lugar de verde
+    const estatusColor = tieneOrden
+      ? COLORS.inProgressOrder
+      : item.estatus === "pendiente"
         ? COLORS.danger
         : item.estatus === "en_proceso"
           ? COLORS.warning
           : COLORS.success;
 
-    const estatusIcon =
-      item.estatus === "pendiente"
+    const estatusIcon = tieneOrden
+      ? "construct-outline" // Icono de llave/proceso técnico para diferenciarlo de cerrado
+      : item.estatus === "pendiente"
         ? "alert-circle-outline"
         : item.estatus === "en_proceso"
           ? "refresh-outline"
@@ -291,9 +337,15 @@ export default function NotificacionesAveriaSupervisor() {
     return (
       <TouchableOpacity
         style={styles.card}
-        onPress={() =>
-          router.push(`/supervisor/averia/${item.NotifNo}/detalles`)
-        }
+        onPress={() => {
+          if (tieneOrden) {
+            // 🚀 Si ya tiene orden, lo mandamos a la vista de detalles/visualización de la orden existente
+            router.push(`/supervisor/averia/${item.NotifNo}/detalles?orderId=${item.order_id}`);
+          } else {
+            // ➕ Si NO tiene orden, lo mandamos a crearla normalmente
+            router.push(`/supervisor/averia/${item.NotifNo}/detalles`);
+          }
+        }}
       >
         <View style={[styles.sideBar, { backgroundColor: estatusColor }]} />
 
@@ -301,7 +353,11 @@ export default function NotificacionesAveriaSupervisor() {
           <View style={styles.topRow}>
             <View style={styles.titleWrap}>
               <View style={styles.avatar}>
-                <Ionicons name="warning-outline" size={20} color="#0B1F3B" />
+                <Ionicons 
+                  name={tieneOrden ? "construct" : "warning-outline"} 
+                  size={20} 
+                  color={tieneOrden ? COLORS.inProgressOrder : "#0B1F3B"} 
+                />
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title} numberOfLines={1}>
@@ -325,11 +381,11 @@ export default function NotificacionesAveriaSupervisor() {
               <Ionicons
                 name={estatusIcon}
                 size={14}
-                color="#0B1F3B"
+                color={tieneOrden ? COLORS.inProgressOrder : "#0B1F3B"}
                 style={{ marginRight: 4 }}
               />
-              <Text style={styles.statusText}>
-                {item.estatus?.replace("_", " ") || "—"}
+              <Text style={[styles.statusText, tieneOrden && { color: COLORS.inProgressOrder, fontWeight: "700" }]}>
+                {tieneOrden ? `Orden: ${item.order_id}` : item.estatus?.replace("_", " ") || "—"}
               </Text>
             </View>
           </View>
@@ -402,7 +458,7 @@ export default function NotificacionesAveriaSupervisor() {
 
         <TextInput
           style={styles.searchInput}
-          placeholder="Buscar por #, equipo, cliente, ubicación…"
+          placeholder="Buscar por #, equipo, cliente, ubicación, orden…"
           placeholderTextColor="#9AA5B1"
           value={query}
           onChangeText={setQuery}
@@ -458,7 +514,6 @@ export default function NotificacionesAveriaSupervisor() {
         <TouchableOpacity
           style={styles.applyBtn}
           onPress={async () => {
-            // ✅ primero intenta cache del nuevo rango, luego red
             await loadFromCache();
             await fetchAverias();
           }}
