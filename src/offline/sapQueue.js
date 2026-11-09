@@ -1134,16 +1134,6 @@ const normOrderKey = (v) =>
 
 // Solo los paquetes masivos comparten la tarea en segundo plano de SAP.
 function bulkOrderKeyOf(item, sendPayload, endpoint) {
-  // FMS NUEVO - INICIO (SOLO DIAGNÓSTICO DE ORDEN)
-  console.log("[SAP QUEUE][ORDEN POST]", {
-    hora: new Date().toISOString().slice(11, 23),
-    tipo: item?.type,
-    orden: item?.orderId,
-    bulkId: sendPayload?.BulkId,
-    creado: item?.createdAt,
-    endpoint: String(endpoint || "").split("/").pop(),
-  });
-  // FMS NUEVO - FIN
   if (!String(endpoint || "").includes("WorkOrderBulkSet")) return "";
 
   const fromBody =

@@ -16,12 +16,13 @@ import {
 import DateTimePicker from "@react-native-community/datetimepicker";
 import { useLocalSearchParams, router } from "expo-router";
 // FMS NUEVO - INICIO
-import { encolarCreacion, procesarCreaciones } from "../../../../src/offline/ordenCreacionQueue";
+import { encolarCreacion, procesarCreaciones, usarUsuarioCola } from "../../../../src/offline/ordenCreacionQueue";
 import { OPCIONES_CREACION } from "../../../../src/offline/ordenCreacionConfig";
 // FMS NUEVO - FIN
 import { Ionicons } from "@expo/vector-icons";
 import Header from "../../../../src/components/Header";
 import api from "../../../../src/services/api";
+import { useAuth } from "../../../../src/context/AuthContext";
 // FMS NUEVO - INICIO
 import { extractOrderFromReturn, extractFromSapMessageHeader } from "../../../../src/utils/sapOrderReturn";
 // FMS NUEVO - FIN
@@ -206,6 +207,7 @@ export default function CrearOrdenMantto() {
   );
 
   const [saving, setSaving] = useState(false);
+  const { user: usuarioAuth } = useAuth(); // FMS NUEVO
   const [payloadPreview, setPayloadPreview] = useState(null);
 
   const [multiVisible, setMultiVisible] = useState(false);
@@ -827,6 +829,14 @@ const handleIrAVistaPrevia = () => {
   const onConfirmarGuardado = async () => {
     if (!payloadPreview) return;
     const avisoId = String(notifNo || averiaid || "").trim();
+    // FMS NUEVO - INICIO
+    const correo = String(usuarioAuth?.email || usuarioAuth?.correo || "").trim().toLowerCase();
+    if (!correo) {
+      Alert.alert("Sin sesión", "No se pudo identificar al usuario. Vuelve a iniciar sesión e inténtalo de nuevo.");
+      return;
+    }
+    await usarUsuarioCola(correo);
+    // FMS NUEVO - FIN
     const r = await encolarCreacion({
       avisoId,
       payload: payloadPreview,
