@@ -15,9 +15,16 @@ import {
 } from "react-native";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import { useLocalSearchParams, router } from "expo-router";
+// FMS NUEVO - INICIO
+import { encolarCreacion, procesarCreaciones } from "../../../../src/offline/ordenCreacionQueue";
+import { OPCIONES_CREACION } from "../../../../src/offline/ordenCreacionConfig";
+// FMS NUEVO - FIN
 import { Ionicons } from "@expo/vector-icons";
 import Header from "../../../../src/components/Header";
 import api from "../../../../src/services/api";
+// FMS NUEVO - INICIO
+import { extractOrderFromReturn, extractFromSapMessageHeader } from "../../../../src/utils/sapOrderReturn";
+// FMS NUEVO - FIN
 
 const COLORS = {
   pageBg: "#F4F6F9",
@@ -111,125 +118,6 @@ function normActivity(n) {
 
 function normItemNumberByIndex(index) {
   return String((index + 1) * 10).padStart(4, "0");
-}
-
-function extractOrderFromReturn(dataOrD) {
-  const d = dataOrD?.d ? dataOrD.d : dataOrD;
-  const returns = d?.Return?.results || d?.ReturnSet?.results || [];
-  if (!Array.isArray(returns) || returns.length === 0) {
-    return {
-      orderId: null,
-      notifNo: null,
-      offerNo: null,
-      offerMessage: null,
-      successItem: null,
-      offerItem: null,
-      errors: [],
-      warnings: [],
-      message: null,
-      successMessages: [],
-    };
-  }
-
-  const upperType = (x) => String(x?.Type || "").toUpperCase();
-  const isSuccess = (r) => upperType(r) === "S";
-  const isError = (r) => upperType(r) === "E";
-  const isWarning = (r) => upperType(r) === "W" || upperType(r) === "A";
-
-  const errors = returns.filter(isError);
-  const warnings = returns.filter(isWarning);
-
-  const successMessages = returns
-    .filter(isSuccess)
-    .map((r) => String(r?.Message || "").trim())
-    .filter(Boolean);
-
-  const successItem =
-    returns.find(
-      (r) =>
-        isSuccess(r) &&
-        String(r?.MessageV2 || "")
-          .trim()
-          .match(/^\d+$/),
-    ) ||
-    returns.find(
-      (r) =>
-        isSuccess(r) &&
-        String(r?.Message || "")
-          .toLowerCase()
-          .includes("se ha grabado con número"),
-    ) ||
-    returns.find(isSuccess) ||
-    null;
-
-  const message = successItem?.Message ? String(successItem.Message) : null;
-
-  let orderId = successItem?.MessageV2
-    ? String(successItem.MessageV2).trim()
-    : null;
-  let notifNo = successItem?.MessageV3
-    ? String(successItem.MessageV3).trim()
-    : null;
-
-  const offerItem =
-    returns.find(
-      (r) =>
-        isSuccess(r) &&
-        (String(r?.Id || "").toUpperCase() === "ZSD" ||
-          String(r?.Message || "")
-            .toLowerCase()
-            .includes("oferta creada")),
-    ) || null;
-
-  const offerMessage = offerItem?.Message
-    ? String(offerItem.Message).trim()
-    : null;
-
-  let offerNo = null;
-  if (offerMessage) {
-    const m = offerMessage.match(/oferta creada:\s*([0-9]+)/i);
-    if (m?.[1]) offerNo = m[1];
-    if (!offerNo) {
-      const nums = offerMessage.match(/\b\d{6,15}\b/g) || [];
-      offerNo = nums[0] || null;
-    }
-  }
-
-  if ((!orderId || !notifNo) && message) {
-    const numbers = message.match(/\b\d{6,12}\b/g) || [];
-    if (!orderId && numbers.length >= 1) orderId = numbers[0];
-    if (!notifNo && numbers.length >= 2) notifNo = numbers[1];
-  }
-
-  return {
-    orderId,
-    notifNo,
-    offerNo,
-    offerMessage,
-    successItem,
-    offerItem,
-    errors,
-    warnings,
-    message,
-    successMessages,
-  };
-}
-
-function extractFromSapMessageHeader(headers) {
-  const h = headers || {};
-  const raw = h["sap-message"] || h["SAP-MESSAGE"] || h["Sap-Message"] || null;
-  if (!raw) return { orderId: null, notifNo: null, text: null };
-
-  try {
-    const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
-    const text = String(obj?.message || obj?.msg || obj?.Message || "").trim();
-    const nums = text.match(/\b\d{6,12}\b/g) || [];
-    return { orderId: nums[0] || null, notifNo: nums[1] || null, text };
-  } catch (e) {
-    const text = String(raw || "").trim();
-    const nums = text.match(/\b\d{6,12}\b/g) || [];
-    return { orderId: nums[0] || null, notifNo: nums[1] || null, text };
-  }
 }
 
 const FIXED_INTRM_FOR_BOM = "MX06GR478NL3-10P";
@@ -910,7 +798,58 @@ const handleIrAVistaPrevia = () => {
     setStep(3);
   };
 
+  // FMS NUEVO - INICIO
+  const verificarOrdenDelAviso = async (avisoId) => {
+    const res = await api.get(
+      `/api/odata/ZCS_GET_NOTIFICATION_SRV/NotificationHeaderSet('${encodeURIComponent(avisoId)}')`,
+      { params: { $format: "json" }, timeout: 20000 },
+    );
+    const hdr = res?.data?.d ?? res?.data ?? null;
+    return String(hdr?.Orderid ?? hdr?.OrderId ?? hdr?.Aufnr ?? "").trim() || null;
+  };
+
+  // Consulta a los 5, 15 y 30 s. Devuelve el número de orden o null.
+  const esperarOrdenDelAviso = async (avisoId) => {
+    if (!avisoId) return null;
+    for (const espera of [5000, 15000, 30000]) {
+      await new Promise((r) => setTimeout(r, espera));
+      try {
+        const orden = await verificarOrdenDelAviso(avisoId);
+        if (orden) return orden;
+      } catch {}
+    }
+    return null;
+  };
+  // FMS NUEVO - FIN
+
+  // FMS NUEVO - INICIO
+  // Guardar primero, enviar después: la creación queda en la cola y su estado se ve en la lista de avisos.
   const onConfirmarGuardado = async () => {
+    if (!payloadPreview) return;
+    const avisoId = String(notifNo || averiaid || "").trim();
+    const r = await encolarCreacion({
+      avisoId,
+      payload: payloadPreview,
+      resumen: { equipment, shortText },
+    });
+    if (!r.ok) {
+      Alert.alert(
+        "Este aviso ya tiene una creación",
+        `Estado actual: ${r.item.estado}. Revisa la lista de avisos.`,
+      );
+      return;
+    }
+    procesarCreaciones(OPCIONES_CREACION); // sin await: no se espera a SAP
+    Alert.alert(
+      "Guardado",
+      "La orden se está enviando a SAP. Verás su estado en la lista de avisos.",
+      [{ text: "OK", onPress: () => router.replace("/supervisor/averia") }],
+    );
+  };
+  // FMS NUEVO - FIN
+
+  // Envío directo anterior (se conserva por si hay que volver a él)
+  const onConfirmarGuardadoDirecto = async () => {
     if (!payloadPreview) return;
 
     console.log("🚀 [SAP PAYLOAD ENVIADO]:", JSON.stringify(payloadPreview, null, 2));
@@ -920,6 +859,7 @@ const handleIrAVistaPrevia = () => {
       const url = "/api/odata/ZCS_CREATE_WORKORDER_SRV_02/WorkOrderSet";
 
       const res = await api.post(url, payloadPreview, {
+        timeout: 120000, // FMS NUEVO: la creación puede tardar más que el timeout por defecto
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
@@ -960,6 +900,27 @@ const handleIrAVistaPrevia = () => {
         { text: "OK", onPress: () => router.replace("/supervisor/averia") },
       ]);
     } catch (err) {
+      // FMS NUEVO - INICIO
+      // Sin respuesta (timeout o red): SAP pudo haber creado la orden. NO se reenvía:
+      // se consulta el aviso para saber si ya tiene orden.
+      if (!err?.response) {
+        const avisoId = String(notifNo || averiaid || "").trim();
+        const ordenCreada = await esperarOrdenDelAviso(avisoId);
+        if (ordenCreada) {
+          Alert.alert(
+            "Orden creada",
+            `✅ SAP sí creó la orden: ${ordenCreada}\n(la respuesta se perdió por la conexión)`,
+            [{ text: "OK", onPress: () => router.replace("/supervisor/averia") }],
+          );
+          return;
+        }
+        Alert.alert(
+          "Sin confirmación",
+          "No se pudo confirmar si SAP creó la orden. NO la vuelvas a crear todavía: revisa el aviso en unos minutos.",
+        );
+        return;
+      }
+      // FMS NUEVO - FIN
       const sapMsg =
         err?.response?.data?.error?.message?.value ||
         err?.response?.data?.error?.message ||
