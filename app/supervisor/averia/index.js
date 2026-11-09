@@ -19,6 +19,7 @@ import { useAuth } from "../../../src/context/AuthContext";
 import api from "../../../src/services/api";
 // FMS NUEVO - INICIO
 import {
+  usarUsuarioCola,
   useCreaciones, ESTADO, iniciarAutoProceso, procesarCreaciones,
   reintentarVerificacion, reenviar, descartar,
   getProximaPasadaEn,
@@ -178,13 +179,26 @@ export default function NotificacionesAveriaSupervisor() {
     if (nCreadas > 0) fetchAverias({ silent: true });
   }, [nCreadas]);
   // FMS NUEVO - FIN
-  useEffect(() => {
-    iniciarAutoProceso(OPCIONES_CREACION);
-  }, []);
   // FMS NUEVO - FIN
   const { token, user } = useAuth();
+  // FMS NUEVO - INICIO
+  const correoCola = String(user?.email || user?.correo || "").trim().toLowerCase();
+  useEffect(() => {
+    usarUsuarioCola(correoCola);
+    if (correoCola) iniciarAutoProceso(OPCIONES_CREACION);
+  }, [correoCola]);
+  // FMS NUEVO - FIN
 
   const [averias, setAverias] = useState([]);
+  // FMS NUEVO - INICIO
+  // Si SAP ya devuelve la orden del aviso, la entrada CREADA de la cola ya no hace falta.
+  useEffect(() => {
+    averias.forEach((a) => {
+      const c = creaciones[String(a?.NotifNo || "").trim()];
+      if (c?.estado === ESTADO.CREADA && String(a?.order_id || "").trim()) descartar(c.avisoId);
+    });
+  }, [averias, creaciones]);
+  // FMS NUEVO - FIN
   const [loading, setLoading] = useState(true);
   const [cacheInfo, setCacheInfo] = useState(null); // {savedAt}
 

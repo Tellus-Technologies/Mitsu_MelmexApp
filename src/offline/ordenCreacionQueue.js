@@ -7,6 +7,11 @@ import { AppState } from "react-native";
 import { useEffect, useState } from "react";
 
 const KEY = "ordenCreacion:v1";
+// FMS NUEVO - INICIO
+// La cola es por usuario: una creación guardada por uno nunca la envía otro.
+let usuario = "";
+const clave = () => `${KEY}:${usuario}`;
+// FMS NUEVO - FIN
 const POST_URL = "/api/odata/ZCS_CREATE_WORKORDER_SRV_02/WorkOrderSet";
 const POST_TIMEOUT_MS = 120000;
 const MARGEN_SIN_CONFIRMAR_MS = 10 * 60 * 1000;
@@ -27,10 +32,31 @@ let cache = null;
 const listeners = new Set();
 let chain = Promise.resolve();
 
+// FMS NUEVO - INICIO
+export function usarUsuarioCola(correo) {
+  const nuevo = String(correo || "").trim().toLowerCase();
+  if (nuevo === usuario) return;
+  usuario = nuevo;
+  cache = null; // se vuelve a leer, ahora de la cola de este usuario
+  return leer().then((m) => {
+    const snap = { ...m };
+    listeners.forEach((l) => {
+      try {
+        l(snap);
+      } catch {}
+    });
+  });
+}
+// FMS NUEVO - FIN
+
 async function leer() {
   if (cache) return cache;
   try {
-    const raw = await AsyncStorage.getItem(KEY);
+    if (!usuario) {
+      cache = {};
+      return cache;
+    }
+    const raw = await AsyncStorage.getItem(clave());
     cache = raw ? JSON.parse(raw) : {};
   } catch {
     cache = {};
@@ -40,10 +66,11 @@ async function leer() {
 
 function mutar(fn) {
   const run = chain.then(async () => {
+    const k = usuario ? clave() : null; // la clave se fija al empezar la operación
     const m = await leer();
     const res = await fn(m);
     try {
-      await AsyncStorage.setItem(KEY, JSON.stringify(m));
+      if (k) await AsyncStorage.setItem(k, JSON.stringify(m));
     } catch {}
     const snap = { ...m };
     listeners.forEach((l) => {
@@ -61,16 +88,6 @@ const parchear = (id, cambios) =>
   mutar((m) => {
     if (!m[id]) return null;
     m[id] = { ...m[id], ...cambios, actualizadoEn: Date.now() };
-    // FMS NUEVO - INICIO (diagnóstico; quitar antes del build)
-    console.log("[ORDEN QUEUE] Estado:", {
-      aviso: id,
-      estado: m[id].estado,
-      orden: m[id].orderId || null,
-      intentos: m[id].intentos,
-      verificaciones: m[id].verificaciones,
-      error: m[id].error ? String(m[id].error).slice(0, 120) : null,
-    });
-    // FMS NUEVO - FIN
     return m[id];
   });
 
@@ -101,6 +118,9 @@ export function useCreaciones() {
 // Un aviso solo admite una creación. Si ya hay una (en curso, creada o sin confirmar), no se duplica.
 export function encolarCreacion({ avisoId, payload, resumen }) {
   const id = String(avisoId || "").trim();
+  // FMS NUEVO - INICIO
+  if (!usuario) return Promise.resolve({ ok: false, item: { estado: "SIN_USUARIO" } });
+  // FMS NUEVO - FIN
   return mutar((m) => {
     const prev = m[id];
     if (prev && prev.estado !== ESTADO.ERROR) return { ok: false, item: prev };
@@ -166,18 +186,13 @@ export function procesarCreaciones(opciones) {
 
 async function pasada(op) {
   if (!op?.api || !op?.parse || !op?.verificar) return;
+  if (!usuario) return; // sin usuario identificado no se envía nada
   const net = await NetInfo.fetch();
   const online = !!(net?.isConnected && net?.isInternetReachable !== false);
   // FMS NUEVO - INICIO (diagnóstico)
   const activos = Object.values(await leerCreaciones()).filter((i) =>
     [ESTADO.PENDIENTE, ESTADO.ENVIANDO, ESTADO.CONFIRMANDO].includes(i.estado),
   );
-  console.log("[ORDEN QUEUE] Pasada:", {
-    online,
-    conectado: net?.isConnected,
-    alcanzable: net?.isInternetReachable,
-    activos: activos.map((i) => `${i.avisoId}:${i.estado}`),
-  });
   // FMS NUEVO - FIN
   // FMS NUEVO - INICIO
   // NetInfo puede quedarse atascado (sobre todo en el simulador). Si hay algo pendiente,
@@ -293,7 +308,7 @@ async function programarVerificacion() {
 let auto = false;
 // FMS NUEVO - INICIO
 // Latido: mientras haya algo pendiente se reintenta solo, sin depender de que llegue el evento de red.
-const HEARTBEAT_MS = 15000;
+const HEARTBEAT_MS = 30000;
 let proximaPasadaEn = 0;
 export const getProximaPasadaEn = () => proximaPasadaEn;
 // FMS NUEVO - FIN
@@ -301,22 +316,10 @@ export function iniciarAutoProceso(opciones) {
   opcionesActuales = opciones;
   if (auto) return;
   auto = true;
-  // FMS NUEVO - INICIO (diagnóstico)
-  leerCreaciones().then((m) =>
-    console.log(
-      "[ORDEN QUEUE] Contenido al iniciar:",
-      Object.values(m).map((i) => `${i.avisoId}:${i.estado}:${i.orderId || "-"}`),
-    ),
-  );
-  // FMS NUEVO - FIN
   AppState.addEventListener("change", (s) => {
     if (s === "active") procesarCreaciones();
   });
   NetInfo.addEventListener((s) => {
-    console.log("[ORDEN QUEUE] NetInfo:", {
-      conectado: s?.isConnected,
-      alcanzable: s?.isInternetReachable,
-    });
     if (s?.isConnected && s?.isInternetReachable !== false) procesarCreaciones();
   });
   // FMS NUEVO - INICIO
