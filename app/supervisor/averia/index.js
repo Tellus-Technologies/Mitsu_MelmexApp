@@ -17,6 +17,14 @@ import { router } from "expo-router";
 import Header from "../../../src/components/Header";
 import { useAuth } from "../../../src/context/AuthContext";
 import api from "../../../src/services/api";
+// FMS NUEVO - INICIO
+import {
+  useCreaciones, ESTADO, iniciarAutoProceso, procesarCreaciones,
+  reintentarVerificacion, reenviar, descartar,
+  getProximaPasadaEn,
+} from "../../../src/offline/ordenCreacionQueue";
+import { OPCIONES_CREACION } from "../../../src/offline/ordenCreacionConfig";
+// FMS NUEVO - FIN
 
 import {
   loadAveriasListCache,
@@ -125,6 +133,55 @@ const isNetworkError = (err) => {
 };
 
 export default function NotificacionesAveriaSupervisor() {
+  // FMS NUEVO - INICIO
+  const creaciones = useCreaciones();
+  // FMS NUEVO - INICIO
+  const accionReenviar = (cr) =>
+    Alert.alert(
+      "Reenviar creación",
+      cr.estado === "SIN_CONFIRMAR"
+        ? "No se pudo confirmar si SAP creó la orden. Revisa en SAP (IW53) que el aviso NO tenga orden; si ya la tiene, se duplicaría."
+        : "Se enviará de nuevo a SAP.",
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Reenviar",
+          style: "destructive",
+          onPress: async () => {
+            await reenviar(cr.avisoId);
+            procesarCreaciones(OPCIONES_CREACION);
+          },
+        },
+      ],
+    );
+  const accionDescartar = (cr) =>
+    Alert.alert("Descartar", "Se quita esta creación de la cola. El aviso queda sin orden.", [
+      { text: "Cancelar", style: "cancel" },
+      { text: "Descartar", style: "destructive", onPress: () => descartar(cr.avisoId) },
+    ]);
+  const botonCr = { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: "#0A6ED1" };
+  // FMS NUEVO - FIN
+  // FMS NUEVO - INICIO
+  const [segundo, setSegundo] = useState(0);
+  const hayEnCurso = Object.values(creaciones).some((c) =>
+    ["PENDIENTE", "ENVIANDO", "CONFIRMANDO"].includes(c.estado),
+  );
+  useEffect(() => {
+    if (!hayEnCurso) return;
+    const t = setInterval(() => setSegundo((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, [hayEnCurso]);
+
+  // Cuando una creación pasa a CREADA, se recarga la lista para traer el número de orden de SAP.
+  const nCreadas = Object.values(creaciones).filter((c) => c.estado === "CREADA").length;
+  useEffect(() => {
+    if (nCreadas > 0) fetchAverias({ silent: true });
+  }, [nCreadas]);
+  // FMS NUEVO - FIN
+  useEffect(() => {
+    iniciarAutoProceso(OPCIONES_CREACION);
+  }, []);
+  // FMS NUEVO - FIN
   const { token, user } = useAuth();
 
   const [averias, setAverias] = useState([]);
@@ -314,8 +371,34 @@ export default function NotificacionesAveriaSupervisor() {
     });
   }, [averias, query]);
 
-  const renderItem = ({ item }) => {
+  const renderItem = ({ item: itemSap }) => {
+    // FMS NUEVO - INICIO
+    // Si la cola ya tiene la orden creada y la lista de SAP aún no la trae, se usa la de la cola.
+    const crCreada = creaciones[String(itemSap.NotifNo || "").trim()];
+    const item =
+      crCreada?.estado === ESTADO.CREADA &&
+      crCreada?.orderId &&
+      !String(itemSap.order_id || "").trim()
+        ? { ...itemSap, order_id: crCreada.orderId }
+        : itemSap;
+    // FMS NUEVO - FIN
     const tieneOrden = !!String(item.order_id || "").trim();
+    // FMS NUEVO - INICIO
+    const cr = creaciones[String(item.NotifNo || "").trim()];
+    const crActiva = cr && cr.estado !== ESTADO.CREADA ? cr : null;
+    const reintentoEn = Math.max(0, Math.ceil((getProximaPasadaEn() - Date.now()) / 1000));
+    const CR_TXT = {
+      PENDIENTE: "En cola",
+      ENVIANDO: "Enviando a SAP…",
+      CONFIRMANDO: "Verificando con SAP…",
+      ERROR: "Error al crear",
+      SIN_CONFIRMAR: "Sin confirmar",
+    };
+    const CR_COLOR = {
+      PENDIENTE: "#6B7280", ENVIANDO: "#0A6ED1", CONFIRMANDO: "#0A6ED1",
+      ERROR: "#C62828", SIN_CONFIRMAR: "#B26A00",
+    };
+    // FMS NUEVO - FIN
 
     // 🔵 Si ya tiene orden, usamos el color azul operativo en lugar de verde
     const estatusColor = tieneOrden
@@ -384,8 +467,16 @@ export default function NotificacionesAveriaSupervisor() {
                 color={tieneOrden ? COLORS.inProgressOrder : "#0B1F3B"}
                 style={{ marginRight: 4 }}
               />
+              {/* FMS NUEVO - INICIO */}
+              {crActiva ? (
+                <Text style={[styles.statusText, { color: CR_COLOR[crActiva.estado], fontWeight: "700" }]}>
+                  {CR_TXT[crActiva.estado]}
+                  {["PENDIENTE", "CONFIRMANDO"].includes(crActiva.estado) ? ` · reintento en ${reintentoEn}s` : ""}
+                </Text>
+              ) : null}
+              {/* FMS NUEVO - FIN */}
               <Text style={[styles.statusText, tieneOrden && { color: COLORS.inProgressOrder, fontWeight: "700" }]}>
-                {tieneOrden ? `Orden: ${item.order_id}` : item.estatus?.replace("_", " ") || "—"}
+                {crActiva ? "" : tieneOrden ? `Orden: ${item.order_id}` : item.estatus?.replace("_", " ") || "—"}
               </Text>
             </View>
           </View>
@@ -413,6 +504,33 @@ export default function NotificacionesAveriaSupervisor() {
               </Text>
             </View>
           </View>
+
+          {/* FMS NUEVO - INICIO */}
+          {crActiva && (crActiva.estado === "ERROR" || crActiva.estado === "SIN_CONFIRMAR") ? (
+            <View style={{ marginTop: 8 }}>
+              {crActiva.error ? (
+                <Text style={{ color: "#C62828", fontSize: 12, marginBottom: 6 }} numberOfLines={3}>
+                  {crActiva.error}
+                </Text>
+              ) : null}
+              <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+                {crActiva.estado === "SIN_CONFIRMAR" ? (
+                  <TouchableOpacity style={botonCr} onPress={() => reintentarVerificacion(crActiva.avisoId)}>
+                    <Text style={{ color: "#0A6ED1", fontWeight: "700" }}>Verificar otra vez</Text>
+                  </TouchableOpacity>
+                ) : null}
+                {crActiva.estado === "SIN_CONFIRMAR" ? (
+                  <TouchableOpacity style={botonCr} onPress={() => accionReenviar(crActiva)}>
+                    <Text style={{ color: "#0A6ED1", fontWeight: "700" }}>Reenviar</Text>
+                  </TouchableOpacity>
+                ) : null}
+                <TouchableOpacity style={[botonCr, { borderColor: "#C62828" }]} onPress={() => accionDescartar(crActiva)}>
+                  <Text style={{ color: "#C62828", fontWeight: "700" }}>Descartar</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          ) : null}
+          {/* FMS NUEVO - FIN */}
         </View>
       </TouchableOpacity>
     );
@@ -535,6 +653,7 @@ export default function NotificacionesAveriaSupervisor() {
           keyExtractor={(item) =>
             item.NotifNo?.toString() ?? Math.random().toString()
           }
+          extraData={[creaciones, segundo]}
           renderItem={renderItem}
           contentContainerStyle={styles.listContent}
           ListEmptyComponent={
