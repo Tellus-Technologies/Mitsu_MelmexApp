@@ -58,6 +58,15 @@ const MATERIAL_CATEGORIES = [
   "BOTONPAROS",
 ];
 
+// FMS NUEVO: empleados del supervisor (se filtra por el correo de la sesión)
+const MECANICOS_ENTITY = "/api/odata/ZSD_CATALOGOS_SRV/EmployeSupervisorSet";
+const MECANICOS_CAMPO_CORREO = "Email"; // ajustar al nombre real del campo
+// FMS NUEVO: equipo que hace el trabajo; "sortfield" es lo que viaja a WorkOrderHeader.Sortfield
+const EQUIPOS_TRABAJO = [
+  { key: "REPARACIONES", titulo: "Reparaciones", sortfield: "REPARACIONES" },
+  { key: "MANTENIMIENTO", titulo: "Mantenimiento", sortfield: "MANTENIMIENTO" },
+];
+
 function elev(multiplier = 1) {
   return Platform.select({
     ios: {
@@ -117,6 +126,21 @@ function normActivity(n) {
   return String(act).padStart(4, "0");
 }
 
+// FMS NUEVO: días no laborables (0 = domingo, 6 = sábado). Ajusta según tu operación.
+const DIAS_NO_LABORABLES = [0, 6];
+
+// Fin = inicio + (días - 1) días laborables, a la hora de inicio + horas por día
+function calcularFin(inicio, dias, horasDia) {
+  const d = new Date(inicio);
+  let restantes = Math.max(1, Math.round(Number(dias) || 1)) - 1;
+  while (restantes > 0) {
+    d.setDate(d.getDate() + 1);
+    if (!DIAS_NO_LABORABLES.includes(d.getDay())) restantes -= 1;
+  }
+  d.setHours(d.getHours() + Math.round(Number(horasDia) || 8), d.getMinutes(), 0, 0);
+  return d;
+}
+
 function normItemNumberByIndex(index) {
   return String((index + 1) * 10).padStart(4, "0");
 }
@@ -152,6 +176,7 @@ function emptyOperation(index, planPlant) {
     Activity: activity,
     Description: "",
     DurationNormal: "",
+    Dias: "1",
     IsExternal: false,
     Components: [],
   };
@@ -195,7 +220,7 @@ export default function CrearOrdenMantto() {
     }
   }, [params?.piezas]);
 
-  const [orderType] = useState("SM01");
+  //const [orderType] = useState("SM01");
   const [planPlant] = useState("TLP1");
 
   const [startDT, setStartDT] = useState(datePlusDays(8, 0, 0));
@@ -221,6 +246,73 @@ export default function CrearOrdenMantto() {
   const [dtPickerTemp, setDtPickerTemp] = useState(new Date());
 
   const [peopleCount, setPeopleCount] = useState(null);
+
+
+    // FMS NUEVO - INICIO: tipo de reparación y mecánico
+  const [tipoReparacion, setTipoReparacion] = useState(null); // "MENOR" | "MAYOR"
+    // FMS NUEVO - INICIO
+  const [equipoTrabajo, setEquipoTrabajo] = useState(null); // "REPARACIONES" | "MANTENIMIENTO"
+  // Mayor = SM04, menor = SM05 (SM01 solo mientras no se elige)
+  const orderType = tipoReparacion === "MAYOR" ? "SM04" : tipoReparacion === "MENOR" ? "SM05" : "SM01";
+  // FMS NUEVO - FIN
+  const [mecanicos, setMecanicos] = useState([]);
+  const [mecanicosSel, setMecanicosSel] = useState([]); // varios, hasta peopleCount
+  const [sinAsignar, setSinAsignar] = useState(false);
+    // FMS NUEVO: mecánico líder (si no hay uno válido, el primero elegido)
+  const [liderId, setLiderId] = useState("");
+  const liderEfectivo = mecanicosSel.some((m) => m.Id === liderId)
+    ? liderId
+    : (mecanicosSel[0]?.Id || "");
+  const [cargandoMec, setCargandoMec] = useState(false);
+  const [errorMec, setErrorMec] = useState("");
+
+  const cargarMecanicos = async () => {
+    setCargandoMec(true);
+    setErrorMec("");
+    try {
+      const correo = String(usuarioAuth?.email || usuarioAuth?.correo || "").trim().toLowerCase();
+      if (!correo) throw new Error("Sin correo de sesión");
+
+      const filtro = `${MECANICOS_CAMPO_CORREO} eq '${correo}'`;
+      const url = `${MECANICOS_ENTITY}?$filter=${encodeURIComponent(filtro)}&$format=json`;
+      const res = await api.get(url, { headers: { Accept: "application/json" } });
+      const data = res?.data?.d?.results ?? res?.data?.value ?? [];
+
+      console.log("[MECANICOS] filas:", data.length, "primera:", JSON.stringify(data[0] || null));
+
+            setMecanicos(
+        data
+          .map((x) => ({
+            Id: String(x?.ID ?? x?.Id ?? "").trim(),
+            Nombre: String(x?.Nombre ?? "").trim(),
+            Email: String(x?.Email ?? "").trim().toLowerCase(),
+            Propio: true, // este set trae los empleados a cargo del supervisor
+          }))
+          .filter((m) => m.Id),
+      );
+    } catch (e) {
+      console.log("[MECANICOS] error:", e?.response?.data || e?.message);
+      setErrorMec("No se pudo cargar la lista de mecánicos.");
+    } finally {
+      setCargandoMec(false);
+    }
+  };
+
+    const elegirTipoReparacion = (tipo) => {
+    setTipoReparacion(tipo);
+    if (tipo === "MAYOR") {
+      setMecanicosSel([]);
+      setSinAsignar(false);
+    }
+    if (tipo === "MENOR" && mecanicos.length === 0 && !cargandoMec) cargarMecanicos();
+  };
+
+  // Al bajar el número de personas se recorta la selección
+  const cambiarPersonas = (n) => {
+    setPeopleCount(n);
+    setMecanicosSel((prev) => prev.slice(0, n));
+  };
+  // FMS NUEVO - FIN
 
   const goBack = () => {
     if (step > 1) {
@@ -715,6 +807,20 @@ export default function CrearOrdenMantto() {
         ? Number(peopleCount)
         : 1;
 
+            // FMS NUEVO - INICIO: líder y ayudantes (solo reparación menor con mecánicos elegidos)
+    const lider =
+      tipoReparacion === "MENOR" && !sinAsignar
+        ? mecanicosSel.find((m) => m.Id === liderEfectivo) || null
+        : null;
+    const ayudantes = lider ? mecanicosSel.filter((m) => m.Id !== lider.Id) : [];
+    // El servicio devuelve la nómina con 10 dígitos (0000004682); PersNo es de 8
+    const persNo8 = (id) => String(id || "").replace(/^0+/, "").padStart(8, "0");
+    // FMS NUEVO - FIN
+
+        // FMS NUEVO: fin calculado por días laborables (se usa el mayor número de días)
+    const diasMax = Math.max(1, ...opsValidas.map((o) => Math.round(Number(o.Dias) || 1)));
+    const finishCalc = calcularFin(startDT, diasMax, opsValidas[0]?.DurationNormal);
+
     return {
       WorkOrderHeader: {
         OrderType: String(orderType).trim(),
@@ -725,6 +831,7 @@ export default function CrearOrdenMantto() {
         StartDate: String(startDateStr).trim(),
         FinishDate: String(finishDateStr).trim(),
         NotifNo: notifOriginal,
+        Sortfield: EQUIPOS_TRABAJO.find((e) => e.key === equipoTrabajo)?.sortfield || "",
       },
       WorkOrderOperationSet: opsValidas.map((op) => {
         const base = {
@@ -736,9 +843,23 @@ export default function CrearOrdenMantto() {
           NumberOfCapacities: String(numPeople),
         };
         if (op.IsExternal) base.ControlKey = "X";
+                // FMS NUEVO: trabajo manual (ClvCá 0), igual que lo capturado a mano en IW32
+        if (!op.IsExternal) {
+          const dias = Math.max(1, Math.round(Number(op.Dias) || 1));
+          base.WorkActivity = String(Number((dias * Number(op.DurationNormal) * numPeople).toFixed(2)));
+          base.UnWork = "H";
+          base.DurationNormalUnit = "H";
+          base.CalcKey = "0";
+        }
+        if (lider) base.PersNo = persNo8(lider.Id);
         return base;
       }),
       WorkOrderComponentSet: componentItems,
+            // FMS NUEVO: interlocutores = líder (Z1) + ayudantes (Z2)
+            WorkOrderPartnerSet: [
+        ...(lider ? [{ PartnRole: "Z1", Partner: persNo8(lider.Id) }] : []),
+        ...ayudantes.map((m) => ({ PartnRole: "Z2", Partner: persNo8(m.Id) })),
+      ],
       Return: [],
     };
   };
@@ -837,11 +958,27 @@ const handleIrAVistaPrevia = () => {
     }
     await usarUsuarioCola(correo);
     // FMS NUEVO - FIN
-    const r = await encolarCreacion({
+        const r = await encolarCreacion({
       avisoId,
       payload: payloadPreview,
-      resumen: { equipment, shortText },
+      resumen: {
+        equipment,
+        shortText,
+        tipoReparacion, // FMS NUEVO
+        equipoTrabajo,
+        orderType,
+        mecanicos: sinAsignar
+          ? []
+          : mecanicosSel.map((m) => ({
+              id: m.Id,
+              nomina: String(m.Id).replace(/^0+/, ""),
+              nombre: m.Nombre,
+              email: m.Email || "",
+              rol: m.Id === liderEfectivo ? "LIDER" : "AYUDANTE",
+            })),
+      },
     });
+    
     if (!r.ok) {
       Alert.alert(
         "Este aviso ya tiene una creación",
@@ -1062,20 +1199,204 @@ const handleIrAVistaPrevia = () => {
               </View>
             </View>
 
+            {/* FMS NUEVO - INICIO */}
             <View style={styles.card}>
-              <Text style={styles.sectionTitle}>Asignación</Text>
-              <SelectNumber
-                label="Seleccione el número de personas que se asignarán"
-                value={peopleCount}
-                min={1}
-                max={20}
-                onSelect={setPeopleCount}
-              />
+              <Text style={styles.sectionTitle}>Tipo de reparación</Text>
+              <View style={styles.toggleRow}>
+                <TouchableOpacity
+                  style={[styles.tipoRepBtn, tipoReparacion === "MENOR" && styles.tipoRepBtnActive]}
+                  onPress={() => elegirTipoReparacion("MENOR")}
+                  activeOpacity={0.85}
+                >
+                  <Text style={[styles.tipoRepTitle, tipoReparacion === "MENOR" && styles.tipoRepTextActive]}>Reparación menor</Text>
+                  <Text style={[styles.tipoRepHint, tipoReparacion === "MENOR" && styles.tipoRepTextActive]}>Eliges el mecánico ahora</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.tipoRepBtn, tipoReparacion === "MAYOR" && styles.tipoRepBtnActive]}
+                  onPress={() => elegirTipoReparacion("MAYOR")}
+                  activeOpacity={0.85}
+                >
+                  <Text style={[styles.tipoRepTitle, tipoReparacion === "MAYOR" && styles.tipoRepTextActive]}>Reparación mayor</Text>
+                  <Text style={[styles.tipoRepHint, tipoReparacion === "MAYOR" && styles.tipoRepTextActive]}>Se asigna en programación</Text>
+                </TouchableOpacity>
+              </View>
             </View>
+
+                        {/* FMS NUEVO - INICIO: equipo que hace el trabajo */}
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>¿Qué equipo hará el trabajo?</Text>
+              <View style={styles.toggleRow}>
+                {EQUIPOS_TRABAJO.map((e) => (
+                  <TouchableOpacity
+                    key={e.key}
+                    style={[styles.tipoRepBtn, equipoTrabajo === e.key && styles.tipoRepBtnActive]}
+                    onPress={() => setEquipoTrabajo(e.key)}
+                    activeOpacity={0.85}
+                  >
+                    <Text style={[styles.tipoRepTitle, equipoTrabajo === e.key && styles.tipoRepTextActive]}>{e.titulo}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+            {/* FMS NUEVO - FIN */}
+
+            {tipoReparacion === "MAYOR" && (
+              <View style={styles.card}>
+                <Text style={styles.sectionTitle}>Asignación</Text>
+                <Text style={styles.sectionSubtitle}>
+                  Las reparaciones mayores no llevan mecánico al crearse. Quedan en "Por programar" para asignar cuadrilla y fecha.
+                </Text>
+                                <View style={{ marginTop: 10 }}>
+                  <SelectNumber
+                    label="Personas estimadas"
+                    value={peopleCount}
+                    min={1}
+                    max={20}
+                    onSelect={setPeopleCount}
+                  />
+                </View>
+              </View>
+            )}
+
+                   {tipoReparacion === "MENOR" && (() => {
+              const cupo = Number(peopleCount) || 0;
+              const faltan = cupo - mecanicosSel.length;
+              const libres = mecanicos.filter((m) => !mecanicosSel.some((s) => s.Id === m.Id));
+              return (
+                <View style={styles.card}>
+                  <Text style={styles.sectionTitle}>¿Quién la atiende?</Text>
+                  <SelectNumber
+                    label="¿Cuántas personas se asignarán?"
+                    value={peopleCount}
+                    min={1}
+                    max={Math.max(1, Math.min(20, mecanicos.length || 20))}
+                    onSelect={cambiarPersonas}
+                  />
+
+                  {!!cupo && (
+                    <View style={{ marginTop: 12 }}>
+                      {cargandoMec ? (
+                        <ActivityIndicator style={{ marginVertical: 12 }} />
+                      ) : errorMec ? (
+                        <TouchableOpacity onPress={cargarMecanicos}>
+                          <Text style={{ color: COLORS.danger, fontSize: 12, marginVertical: 8 }}>{errorMec} Toca para reintentar.</Text>
+                        </TouchableOpacity>
+                      ) : sinAsignar ? (
+                        <View style={[styles.mecRow, styles.mecRowActive]}>
+                          <Ionicons name="checkmark-circle" size={20} color={COLORS.accent} />
+                          <Text style={styles.mecText}>Sin asignar por ahora</Text>
+                          <TouchableOpacity onPress={() => setSinAsignar(false)} hitSlop={8}>
+                            <Text style={{ color: COLORS.accent, fontSize: 12, fontWeight: "800" }}>Cambiar</Text>
+                          </TouchableOpacity>
+                        </View>
+                      ) : (
+                        <>
+                          <Text style={styles.fieldLabel}>
+                            {faltan > 0
+                              ? `Elige ${faltan} mecánico${faltan === 1 ? "" : "s"} más (${mecanicosSel.length} de ${cupo})`
+                              : `Completo: ${cupo} de ${cupo}`}
+                          </Text>
+
+                                                    {mecanicosSel.map((m) => {
+                            const esLider = m.Id === liderEfectivo;
+                            return (
+                              <View key={m.Id} style={[styles.mecRow, styles.mecRowActive]}>
+                                <Ionicons name={esLider ? "star" : "checkmark-circle"} size={20} color={COLORS.accent} />
+                                <View style={{ flex: 1 }}>
+                                  <Text style={styles.mecText}>{m.Nombre}</Text>
+                                  <Text style={styles.mecNomina}>
+                                    Nómina {String(m.Id).replace(/^0+/, "")} · {esLider ? "Mecánico líder" : "Ayudante"}
+                                  </Text>
+                                </View>
+                                <View style={{ alignItems: "flex-end", gap: 6 }}>
+                                  {!esLider && mecanicosSel.length > 1 && (
+                                    <TouchableOpacity onPress={() => setLiderId(m.Id)} hitSlop={8}>
+                                      <Text style={{ color: COLORS.accent, fontSize: 12, fontWeight: "800" }}>Hacer líder</Text>
+                                    </TouchableOpacity>
+                                  )}
+                                  <TouchableOpacity
+                                    onPress={() => setMecanicosSel((prev) => prev.filter((x) => x.Id !== m.Id))}
+                                    hitSlop={8}
+                                  >
+                                    <Text style={{ color: COLORS.danger, fontSize: 12, fontWeight: "800" }}>Quitar</Text>
+                                  </TouchableOpacity>
+                                </View>
+                              </View>
+                            );
+                          })}
+
+                          {faltan > 0 && (
+                            <>
+                              {[
+                                { titulo: "Mis mecánicos", lista: libres.filter((m) => m.Propio) },
+                                { titulo: "Otros disponibles", lista: libres.filter((m) => !m.Propio) },
+                              ].map((g) => (
+                                <View key={g.titulo} style={{ marginTop: 10 }}>
+                                  <Text style={styles.fieldLabel}>{g.titulo}</Text>
+                                  {g.lista.length === 0 ? (
+                                    <Text style={{ fontSize: 11, color: COLORS.muted }}>Sin personas en este grupo.</Text>
+                                  ) : (
+                                    g.lista.map((m) => (
+                                      <TouchableOpacity
+                                        key={m.Id}
+                                        style={styles.mecRow}
+                                        onPress={() => setMecanicosSel((prev) => (prev.length < cupo ? [...prev, m] : prev))}
+                                        activeOpacity={0.85}
+                                      >
+                                        <Ionicons name="radio-button-off" size={18} color={COLORS.accent} />
+                                        <View style={{ flex: 1 }}>
+                                          <Text style={styles.mecText}>{m.Nombre || m.Id}</Text>
+                                          <Text style={styles.mecNomina}>Nómina {String(m.Id).replace(/^0+/, "")}</Text>
+                                        </View>
+                                        {!m.Propio && <Text style={styles.mecTag}>prestado</Text>}
+                                      </TouchableOpacity>
+                                    ))
+                                  )}
+                                </View>
+                              ))}
+
+                              {mecanicosSel.length === 0 && (
+                                <TouchableOpacity
+                                  style={[styles.mecRow, { marginTop: 10 }]}
+                                  onPress={() => setSinAsignar(true)}
+                                  activeOpacity={0.85}
+                                >
+                                  <Ionicons name="radio-button-off" size={18} color={COLORS.accent} />
+                                  <Text style={styles.mecText}>Sin asignar por ahora</Text>
+                                </TouchableOpacity>
+                              )}
+                            </>
+                          )}
+                        </>
+                      )}
+                    </View>
+                  )}
+                </View>
+              );
+            })()}
+
+
+            {/* FMS NUEVO - FIN */}
 
             <Pressable
               style={styles.btnPrimary}
               onPress={() => {
+
+                                // FMS NUEVO - INICIO
+                if (!tipoReparacion) {
+                  return Alert.alert("Faltan datos", "Elige si es reparación menor o mayor.");
+                }
+                if (!equipoTrabajo) {
+                  return Alert.alert("Faltan datos", "Elige el equipo que hará el trabajo.");
+                }
+                if (tipoReparacion === "MENOR" && !peopleCount) {
+                  return Alert.alert("Faltan datos", "Indica cuántas personas se asignarán.");
+                }
+                if (tipoReparacion === "MENOR" && !sinAsignar && mecanicosSel.length !== Number(peopleCount)) {
+                  return Alert.alert("Faltan datos", `Elige ${peopleCount} mecánico(s), o marca "Sin asignar por ahora".`);
+                }
+                // FMS NUEVO - FIN
+
                 if (!headerShortText.trim()) {
                   return Alert.alert("Faltan datos", "Captura la descripción corta de la orden.");
                 }
@@ -1273,31 +1594,44 @@ const handleIrAVistaPrevia = () => {
                         {/* ======================================================== */}
                         {/* PASO 3: DURACIÓN EN HORAS (Se activa al completar Paso 2) */}
                         {/* ======================================================== */}
-                        {paso2Completo && (
+                                               {paso2Completo && (
                           <View style={styles.pasoPreguntaContainer}>
                             <View style={styles.pasoHeaderRow}>
                               <View style={styles.numeroPasoBadge}><Text style={styles.numeroPasoText}>3</Text></View>
-                              <Text style={styles.fieldLabelQuestion}>¿Cuánto tiempo (duración en horas) tomará esta tarea?*</Text>
+                              <Text style={styles.fieldLabelQuestion}>¿Cuántos días y cuántas horas por día trabaja cada persona?*</Text>
                             </View>
 
-                            <View style={{ width: 140 }}>
-                              <Field
-                            label=""
-                            value={op.DurationNormal}
-                            onChangeText={(txt) => {
-                              const valorLimpio = String(txt || "").replace(/[^0-9.]/g, "");
-                              updateOperation(opIndex, "DurationNormal", valorLimpio);
-                              
-                              // 🚀 Si acaba de poner un valor válido, hacemos scroll automático hacia abajo
-                              if (valorLimpio.length > 0) {
-                                scrollToBottom();
-                              }
-                            }}
-                            placeholder="Ej. 3"
-                            keyboardType="numeric"
-                          />
+                            <View style={{ flexDirection: "row", gap: 10 }}>
+                              <View style={{ flex: 1 }}>
+                                <Field
+                                  label="Días"
+                                  value={op.Dias}
+                                  onChangeText={(txt) => updateOperation(opIndex, "Dias", String(txt || "").replace(/[^0-9]/g, ""))}
+                                  placeholder="Ej. 3"
+                                  keyboardType="numeric"
+                                />
+                              </View>
+                              <View style={{ flex: 1 }}>
+                                <Field
+                                  label="Horas por día"
+                                  value={op.DurationNormal}
+                                  onChangeText={(txt) => {
+                                    const valorLimpio = String(txt || "").replace(/[^0-9.]/g, "");
+                                    updateOperation(opIndex, "DurationNormal", valorLimpio);
+                                    if (valorLimpio.length > 0) scrollToBottom();
+                                  }}
+                                  placeholder="Ej. 8"
+                                  keyboardType="numeric"
+                                />
+                              </View>
                             </View>
-                            {faltaDuracion && <Text style={styles.inputHelperText}>👉 Indica las horas para habilitar las refacciones de la BOM.</Text>}
+
+                            {!!op.DurationNormal && !!op.Dias && (
+                              <Text style={styles.subSectionHint}>
+                                {`${Number(peopleCount) || 1} persona(s) × ${op.DurationNormal} h × ${op.Dias} día(s) = ${(Number(peopleCount) || 1) * Number(op.DurationNormal) * Number(op.Dias)} h de trabajo total`}
+                              </Text>
+                            )}
+                            {faltaDuracion && <Text style={styles.inputHelperText}>👉 Indica las horas por día para habilitar las refacciones de la BOM.</Text>}
                           </View>
                         )}
 
@@ -1668,6 +2002,12 @@ const handleIrAVistaPrevia = () => {
                 <Text style={styles.previewText}>Inicio: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.StartDate}</Text></Text>
                 <Text style={styles.previewText}>Fin: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.FinishDate}</Text></Text>
                 <Text style={styles.previewText}>Aviso Referencia: <Text style={styles.previewValue}>{payloadPreview.WorkOrderHeader.NotifNo}</Text></Text>
+                <Text style={styles.previewText}>Tipo de reparación: <Text style={styles.previewValue}>{tipoReparacion === "MAYOR" ? "Mayor" : "Menor"}</Text></Text>
+                <Text style={styles.previewText}>Equipo de trabajo: <Text style={styles.previewValue}>{EQUIPOS_TRABAJO.find((e) => e.key === equipoTrabajo)?.titulo || "—"}</Text></Text>
+                <Text style={styles.previewText}>Mecánico líder: <Text style={styles.previewValue}>{tipoReparacion === "MAYOR" ? "Por programar" : ((sinAsignar || mecanicosSel.length === 0) ? "Sin asignar" : (() => { const l = mecanicosSel.find((m) => m.Id === liderEfectivo); return l ? `${l.Nombre} (${String(l.Id).replace(/^0+/, "")})` : "—"; })())}</Text></Text>
+                {tipoReparacion === "MENOR" && !sinAsignar && mecanicosSel.length > 1 && (
+                  <Text style={styles.previewText}>Ayudantes: <Text style={styles.previewValue}>{mecanicosSel.filter((m) => m.Id !== liderEfectivo).map((m) => `${m.Nombre} (${String(m.Id).replace(/^0+/, "")})`).join(", ")}</Text></Text>
+                )}
               </View>
 
               <Text style={styles.previewSectionTitle}>Operaciones y Materiales Asignados</Text>
@@ -1691,7 +2031,8 @@ const handleIrAVistaPrevia = () => {
 
                     <Text style={styles.previewText}>Descripción: <Text style={styles.previewValue}>{op.Description}</Text></Text>
                     <Text style={styles.previewText}>Duración: <Text style={styles.previewValue}>{op.DurationNormal} hrs</Text></Text>
-                    <Text style={styles.previewText}>Capacidad personas: <Text style={styles.previewValue}>{op.NumberOfCapacities}</Text></Text>
+                                        <Text style={styles.previewText}>Personas: <Text style={styles.previewValue}>{op.NumberOfCapacities}</Text></Text>
+                    <Text style={styles.previewText}>Trabajo total: <Text style={styles.previewValue}>{op.WorkActivity || "—"} h</Text></Text>
 
                     <View style={styles.operationDivider} />
 
@@ -2784,6 +3125,15 @@ const styles = StyleSheet.create({
   categoryChipTextActive: { color: "#fff" },
 
   toggleRow: { flexDirection: "row", gap: 10, marginBottom: 10 },
+    tipoRepBtn: { flex: 1, borderWidth: 1, borderColor: COLORS.border, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 10, backgroundColor: "#fff" },
+  tipoRepBtnActive: { backgroundColor: COLORS.accent, borderColor: COLORS.accent },
+  tipoRepTitle: { fontSize: 14, fontWeight: "800", color: COLORS.title },
+  tipoRepHint: { fontSize: 11, color: COLORS.text, marginTop: 2 },
+  tipoRepTextActive: { color: "#fff" },
+  mecRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 9, paddingHorizontal: 10, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, marginTop: 6, backgroundColor: "#fff" },
+  mecRowActive: { borderColor: COLORS.accent, backgroundColor: COLORS.chipBg },
+  mecText: { flex: 1, fontSize: 13, color: COLORS.title, fontWeight: "600" },
+  mecTag: { fontSize: 10, color: COLORS.muted, fontWeight: "700" },
   toggleChip: {
     paddingHorizontal: 12,
     paddingVertical: 8,
